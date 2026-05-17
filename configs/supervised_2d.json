@@ -12,12 +12,12 @@
   "data": {
     "patch_size": [512, 512],
     "train": {
-      "manifest": "../data/metadata/manifest.csv",
+      "manifest": "/mnt/share/dyx/Data/Data2d/metadata/manifest.csv",
       "augment": true,
       "samples_per_epoch": 1000
     },
     "val": {
-      "manifest": "../data/validation/metadata/manifest.csv",
+      "manifest": "/mnt/share/dyx/Data/Data2d/validation/metadata/manifest.csv",
       "augment": false,
       "samples_per_epoch": 100
     }

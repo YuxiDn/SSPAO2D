@@ -21,14 +21,14 @@
     "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
   },
   "data": {
-    "patch_size": [256, 256],
+    "patch_size": [512, 512],
     "train": {
-      "image_dir": "../data/abe",
+      "image_dir": "/mnt/share/dyx/Data/Data2d/abe",
       "augment": true,
       "samples_per_epoch": 1000
     },
     "val": {
-      "image_dir": "../data/validation/abe",
+      "image_dir": "/mnt/share/dyx/Data/Data2d/validation/abe",
       "samples_per_epoch": 100
     }
   },

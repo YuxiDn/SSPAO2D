@@ -214,9 +214,9 @@ python scripts/train_supervised.py \
 Multi-GPU training is supported with `torchrun`:
 
 ```bash
-torchrun --nproc_per_node=4 scripts/train_supervised.py \
+torchrun --nproc_per_node=2 scripts/train_supervised.py \
   -c configs/supervised_2d.json \
-  -o outputs/care2d_supervised
+  -o outputs/care2d
 ```
 
 The default supervised configuration uses `care2d` as a baseline. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
