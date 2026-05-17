@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ao2d.data.io import IMAGE_EXTENSIONS, load_image, normalize01, save_image
 from ao2d.models.factory import make_model
+from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 
 
 def main() -> None:
@@ -25,9 +26,30 @@ def main() -> None:
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     config = ckpt["config"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = make_model(config["model"]).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
+    if "object_generator" in ckpt and "aberration_generator" in ckpt:
+        model_cfg = config.get("model", {})
+        zernike_modes = len(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
+        object_generator = OBJGenerator2D(
+            in_channels=int(model_cfg.get("in_channels", 1)),
+            out_channels=int(model_cfg.get("out_channels", 1)),
+            final_activation=str(model_cfg.get("final_activation", "sigmoid")),
+        ).to(device)
+        aberration_generator = AberrationGenerator2D(
+            in_channels=int(model_cfg.get("in_channels", 1)),
+            out_channels=int(model_cfg.get("zernike_modes", zernike_modes)),
+            base_channels=int(model_cfg.get("aberration_base_channels", 32)),
+        ).to(device)
+        object_generator.load_state_dict(ckpt["object_generator"])
+        aberration_generator.load_state_dict(ckpt["aberration_generator"])
+        object_generator.eval()
+        aberration_generator.eval()
+        model = None
+    else:
+        model = make_model(config["model"]).to(device)
+        model.load_state_dict(ckpt["model"])
+        model.eval()
+        object_generator = None
+        aberration_generator = None
 
     input_path = Path(args.input)
     files = [input_path] if input_path.is_file() else sorted(p for p in input_path.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
@@ -38,7 +60,10 @@ def main() -> None:
         for path in tqdm(files, desc="test"):
             img = normalize01(load_image(path), (0.1, 99.9))
             x = torch.from_numpy(np.ascontiguousarray(img))[None, None].float().to(device)
-            out = model(x)
+            if model is None:
+                out = (object_generator(x), aberration_generator(x))
+            else:
+                out = model(x)
             pred = out[0] if isinstance(out, tuple) else out
             restored = pred.squeeze().detach().cpu().numpy()
             save_image(output_dir / f"{path.stem}_restored.tif", restored)

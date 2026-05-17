@@ -31,12 +31,14 @@ src/ao2d/
 scripts/
   train_supervised.py         supervised training
   train_self_supervised.py    self-supervised training
+  train_two_stage.py          two-stage PICNet2D-style training
   test.py                     inference
   prepare_dataset.py          optional synthetic-data utility
 
 configs/
   supervised_2d.json
   self_supervised_2d.json
+  two_stage_2d.json
   model_care2d.json
   model_scare2d.json
   model_rcan2d.json
@@ -243,6 +245,88 @@ $$
 + \lambda_c\left\|\hat{\mathbf{c}}\right\|_2^2.
 $$
 
+## Two-Stage Training
+
+`train_two_stage.py` implements a PICNet2D-style baseline. It trains two networks:
+
+$$
+\hat{x}=G_{\mathrm{obj}}(y),
+\qquad
+\hat{\mathbf{c}}=G_{\mathrm{aber}}(y),
+$$
+
+where \(G_{\mathrm{obj}}\) restores the object image and \(G_{\mathrm{aber}}\) estimates Zernike coefficients.
+
+Compared with `train_self_supervised.py`, the two-stage trainer uses clean/object images to create synthetic aberrated examples with known coefficients:
+
+$$
+y_{\mathrm{synth}} = x * h(\mathbf{c}).
+$$
+
+Stage 1 performs synthetic supervised pretraining:
+
+$$
+\mathcal{L}_{\mathrm{stage1}}
+=
+\left\|\hat{y}_{\mathrm{synth}}-y_{\mathrm{synth}}\right\|_1
++ \alpha\left\|\hat{x}-x\right\|_1
++ \beta\left\|\hat{\mathbf{c}}-\mathbf{c}\right\|_2^2.
+$$
+
+Stage 2 mixes real-image physical consistency and synthetic supervision:
+
+$$
+\mathcal{L}_{\mathrm{stage2}}
+=
+\left\|\hat{y}_{\mathrm{real}}-y_{\mathrm{real}}\right\|_1
++ \gamma\mathcal{L}_{\mathrm{synth}}
++ \lambda_{\mathrm{TV}}\mathrm{TV}(\hat{x})
++ \lambda_c\left\|\hat{\mathbf{c}}\right\|_2^2.
+$$
+
+Use this route when clean object images are available and you want a stronger synthetic-supervision baseline.
+
+Edit `configs/two_stage_2d.json`:
+
+```json
+"data": {
+  "patch_size": [256, 256],
+  "train": {
+    "object_dir": "/path/to/DATA_ROOT/OBJ",
+    "aberrated_dir": "/path/to/DATA_ROOT/abe",
+    "augment": true
+  }
+}
+```
+
+Run both stages:
+
+```bash
+python scripts/train_two_stage.py \
+  -c configs/two_stage_2d.json \
+  -o outputs/picnet2d_two_stage \
+  --stage both
+```
+
+Run only stage 1:
+
+```bash
+python scripts/train_two_stage.py \
+  -c configs/two_stage_2d.json \
+  -o outputs/picnet2d_two_stage \
+  --stage stage1
+```
+
+Run stage 2 from a stage-1 checkpoint:
+
+```bash
+python scripts/train_two_stage.py \
+  -c configs/two_stage_2d.json \
+  -o outputs/picnet2d_two_stage \
+  --stage stage2 \
+  --resume_stage1 outputs/picnet2d_two_stage/stage1_best.pt
+```
+
 ## Inference
 
 ```bash
@@ -254,6 +338,15 @@ python scripts/test.py \
 
 If the model predicts Zernike coefficients, `test.py` also saves `*_zernike_coeff_um.txt`.
 
+Two-stage checkpoints are also supported:
+
+```bash
+python scripts/test.py \
+  --checkpoint outputs/picnet2d_two_stage/stage2_best.pt \
+  --input data/ao2d/abe \
+  --output outputs/picnet2d_two_stage/test_results
+```
+
 ## PICNet2D Baseline vs SCARE2D
 
 SCARE2D is the proposed model in this codebase. PICNet2D is included as a baseline with a more modular inverse-modeling design.
@@ -263,7 +356,8 @@ SCARE2D is the proposed model in this codebase. PICNet2D is included as a baseli
 | Role in this repository | Baseline | Proposed model |
 | Network structure | Separate object generator and aberration regressor | One restoration backbone with a Zernike regression branch |
 | Output | Restored image and predicted Zernike coefficients | Restored image and predicted Zernike coefficients |
-| Training style | Suits staged or hybrid training with synthetic supervision and physical consistency | Suits direct end-to-end self-supervised training |
+| Training script | `scripts/train_two_stage.py` | `scripts/train_self_supervised.py` |
+| Training style | Staged or hybrid training with synthetic supervision and physical consistency | Direct end-to-end self-supervised training |
 | Complexity | More modular and easier to extend with extra constraints | Simpler and easier to train as a single model |
 | Typical use | When synthetic object/aberration labels are available or desired | When only aberrated images and a forward model are available |
 
