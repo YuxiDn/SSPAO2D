@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ao2d.data import AO2DPairDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.factory import make_model
+from ao2d.training.epoch_metrics import write_metrics_xlsx
 from ao2d.training import (
     build_optimizer,
     build_scheduler,
@@ -121,6 +122,8 @@ def main() -> None:
     )
 
     best = float("inf")
+    epoch_rows = []
+    metrics_path = output_dir / "metrics.xlsx"
     try:
         for epoch in range(1, epochs + 1):
             set_sampler_epoch(train_sampler, epoch)
@@ -133,6 +136,17 @@ def main() -> None:
             lr = get_current_lr(optimizer)
             if ctx.is_main:
                 print(f"epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")
+                epoch_rows.append({
+                    "epoch": epoch,
+                    "lr": lr,
+                    "train_loss": train_metrics.get("loss"),
+                    "train_psnr": train_metrics.get("psnr"),
+                    "train_ssim": train_metrics.get("ssim"),
+                    "val_loss": val_metrics.get("loss"),
+                    "val_psnr": val_metrics.get("psnr"),
+                    "val_ssim": val_metrics.get("ssim"),
+                })
+                write_metrics_xlsx(metrics_path, epoch_rows)
 
                 ckpt = {
                     "epoch": epoch,

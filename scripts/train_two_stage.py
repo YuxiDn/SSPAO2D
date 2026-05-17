@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 from ao2d.optics import AO2DConfig, random_zernike_coefficients
+from ao2d.training.epoch_metrics import write_metrics_xlsx
 from ao2d.training import (
     AO2DForwardModel,
     build_optimizer,
@@ -227,6 +228,14 @@ def save_checkpoint(path: Path, epoch: int, obj_net, coeff_net, optimizer, sched
     )
 
 
+def metrics_row(stage: int, epoch: int, lr: float, train_metrics: dict, val_metrics: dict | None = None) -> dict[str, object]:
+    row = {"stage": stage, "epoch": epoch, "lr": lr}
+    row.update({f"train_{key}": value for key, value in train_metrics.items()})
+    if val_metrics is not None:
+        row.update({f"val_{key}": value for key, value in val_metrics.items()})
+    return row
+
+
 def load_stage1(path: str | Path, obj_net, coeff_net, optimizer=None) -> int:
     ckpt = torch.load(path, map_location="cpu")
     obj_net.load_state_dict(ckpt["object_generator"])
@@ -301,6 +310,8 @@ def main() -> None:
     val_loader = build_dataloader(val_set, batch_size, False, num_workers, sampler=val_sampler, drop_last=False) if val_set else None
 
     best = float("inf")
+    epoch_rows = []
+    metrics_path = output_dir / "metrics.xlsx"
     try:
         if args.stage in {"stage1", "both"}:
             epochs_stage1 = int(config["training"].get("epochs_stage1", 50))
@@ -313,6 +324,8 @@ def main() -> None:
                 lr = get_current_lr(optimizer)
                 if ctx.is_main:
                     print(f"stage=1 epoch={epoch:04d} lr={lr:.6g} train={metrics}")
+                    epoch_rows.append(metrics_row(1, epoch, lr, metrics))
+                    write_metrics_xlsx(metrics_path, epoch_rows)
                     save_checkpoint(output_dir / "stage1_last.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage1, config, metrics)
                     if metrics["loss"] < best:
                         best = metrics["loss"]
@@ -337,6 +350,8 @@ def main() -> None:
                 lr = get_current_lr(optimizer)
                 if ctx.is_main:
                     print(f"stage=2 epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")
+                    epoch_rows.append(metrics_row(2, epoch, lr, train_metrics, val_metrics))
+                    write_metrics_xlsx(metrics_path, epoch_rows)
                     save_checkpoint(output_dir / "stage2_last.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage2, config, val_metrics)
                     if val_metrics["loss"] < best:
                         best = val_metrics["loss"]

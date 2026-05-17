@@ -1,5 +1,5 @@
 {
-  "output_dir": "outputs/supervised_2d",
+  "output_dir": "outputs/care2d_supervised_v2",
   "model": {
     "name": "care2d",
     "in_channels": 1,
@@ -10,7 +10,10 @@
     "final_activation": "sigmoid"
   },
   "data": {
-    "patch_size": [512, 512],
+    "patch_size": [
+      512,
+      512
+    ],
     "train": {
       "manifest": "metadata/manifest.csv",
       "augment": true,
@@ -23,14 +26,14 @@
     }
   },
   "training": {
-    "epochs": 100,
-    "batch_size": 4,
+    "epochs": 200,
+    "batch_size": 8,
     "num_workers": 4,
     "optimizer": "Adam",
     "initial_learning_rate": 0.0001,
-    "lr_scheduler": "StepLR",
-    "step_size": 50,
-    "gamma": 0.5,
+    "lr_scheduler": "CosineAnnealingLR",
+    "T_max": 200,
+    "min_lr": 1e-06,
     "weight_decay": 0.0
   }
 }
