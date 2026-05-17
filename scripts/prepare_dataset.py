@@ -100,6 +100,9 @@ def main() -> None:
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
+    def manifest_path(path: Path) -> str:
+        return path.relative_to(output).as_posix()
+
     rng = np.random.default_rng(args.seed)
     torch_gen = torch.Generator().manual_seed(args.seed)
     image_size = tuple(args.image_size)
@@ -154,12 +157,12 @@ def main() -> None:
                 {
                     "object_id": obj_id,
                     "aberration_id": abe_id,
-                    "object_path": str(obj_path),
-                    "no_abe_path": str(target_path),
-                    "abe_path": str(abe_path),
-                    "psf_no_abe_path": str(dirs["psf_target"] / f"{obj_id}.npz"),
-                    "psf_abe_path": str(psf_path),
-                    "zernike_path": str(zernike_path),
+                    "object_path": manifest_path(obj_path),
+                    "no_abe_path": manifest_path(target_path),
+                    "abe_path": manifest_path(abe_path),
+                    "psf_no_abe_path": manifest_path(dirs["psf_target"] / f"{obj_id}.npz"),
+                    "psf_abe_path": manifest_path(psf_path),
+                    "zernike_path": manifest_path(zernike_path),
                     "rms_waves": f"{rms:.8g}",
                     "pixel_size_um": args.pixel_size,
                     "na": args.na,

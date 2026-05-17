@@ -23,12 +23,12 @@
   "data": {
     "patch_size": [512, 512],
     "train": {
-      "image_dir": "/mnt/share/dyx/Data/Data2d/abe",
+      "image_dir": "abe",
       "augment": true,
       "samples_per_epoch": 1000
     },
     "val": {
-      "image_dir": "/mnt/share/dyx/Data/Data2d/validation/abe",
+      "image_dir": "validation/abe",
       "samples_per_epoch": 100
     }
   },

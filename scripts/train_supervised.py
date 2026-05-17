@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ao2d.data import AO2DPairDataset, build_dataloader
+from ao2d.data import AO2DPairDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.factory import make_model
 from ao2d.training import (
     cleanup_distributed,
@@ -33,7 +33,7 @@ def read_config(path: str | Path) -> dict:
         return json.load(f)
 
 
-def make_dataset(config: dict, split: str):
+def make_dataset(config: dict, split: str, data_root: Path | None = None):
     data_cfg = config["data"][split]
     common = dict(
         patch_size=tuple(config["data"].get("patch_size", [256, 256])),
@@ -41,8 +41,13 @@ def make_dataset(config: dict, split: str):
         samples_per_epoch=data_cfg.get("samples_per_epoch"),
     )
     if "manifest" in data_cfg:
-        return AO2DPairDataset.from_manifest(data_cfg["manifest"], **common)
-    return AO2DPairDataset.from_dirs(data_cfg["aberrated_dir"], data_cfg["target_dir"], **common)
+        manifest = resolve_path(data_cfg["manifest"], data_root)
+        return AO2DPairDataset.from_manifest(manifest, data_root=data_root, **common)
+    return AO2DPairDataset.from_dirs(
+        resolve_path(data_cfg["aberrated_dir"], data_root),
+        resolve_path(data_cfg["target_dir"], data_root),
+        **common,
+    )
 
 
 def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool):
@@ -69,10 +74,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a supervised 2-D AO restoration model.")
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("--data-root", default=None, help="Dataset root. Overrides data.root/data.data_root and AO2D_DATA_ROOT.")
     args = parser.parse_args()
 
     ctx = setup_distributed()
     config = read_config(args.config)
+    data_root = get_data_root(config, args.data_root)
     output_dir = Path(args.output or config.get("output_dir", "outputs/supervised"))
     output_dir.mkdir(parents=True, exist_ok=True)
     if ctx.is_main:
@@ -83,8 +90,8 @@ def main() -> None:
     model = wrap_ddp(model, ctx)
     optimizer = AdamW(model.parameters(), lr=float(config["training"].get("lr", 1e-4)), weight_decay=float(config["training"].get("weight_decay", 1e-4)))
 
-    train_set = make_dataset(config, "train")
-    val_set = make_dataset(config, "val") if "val" in config["data"] else None
+    train_set = make_dataset(config, "train", data_root)
+    val_set = make_dataset(config, "val", data_root) if "val" in config["data"] else None
     train_sampler = make_sampler(train_set, ctx, shuffle=True)
     val_sampler = make_sampler(val_set, ctx, shuffle=False)
     train_loader = build_dataloader(

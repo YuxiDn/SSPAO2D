@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ao2d.data import AO2DSelfDataset, build_dataloader
+from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.factory import make_model
 from ao2d.optics import AO2DConfig
 from ao2d.training import (
@@ -77,10 +77,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a self-supervised 2-D SCARE AO model.")
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("--data-root", default=None, help="Dataset root. Overrides data.root/data.data_root and AO2D_DATA_ROOT.")
     args = parser.parse_args()
 
     ctx = setup_distributed()
     config = read_config(args.config)
+    data_root = get_data_root(config, args.data_root)
     output_dir = Path(args.output or config.get("output_dir", "outputs/self_supervised"))
     output_dir.mkdir(parents=True, exist_ok=True)
     if ctx.is_main:
@@ -96,13 +98,13 @@ def main() -> None:
     forward_model = AO2DForwardModel(image_size, zernike_indices, make_optics_config(config)).to(device)
 
     train_set = AO2DSelfDataset(
-        config["data"]["train"]["image_dir"],
+        resolve_path(config["data"]["train"]["image_dir"], data_root),
         patch_size=tuple(config["data"].get("patch_size", [256, 256])),
         augment=bool(config["data"]["train"].get("augment", True)),
         samples_per_epoch=config["data"]["train"].get("samples_per_epoch"),
     )
     val_set = AO2DSelfDataset(
-        config["data"]["val"]["image_dir"],
+        resolve_path(config["data"]["val"]["image_dir"], data_root),
         patch_size=tuple(config["data"].get("patch_size", [256, 256])),
         augment=False,
         samples_per_epoch=config["data"]["val"].get("samples_per_epoch"),

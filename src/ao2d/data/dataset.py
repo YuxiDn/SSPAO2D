@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .io import IMAGE_EXTENSIONS, load_image, normalize01
+from .paths import infer_manifest_data_root, resolve_manifest_record_path
 
 
 def _valid_files(root: str | Path) -> list[Path]:
@@ -117,9 +118,10 @@ class AO2DPairDataset(Dataset):
         return cls(records, **kwargs)
 
     @classmethod
-    def from_manifest(cls, manifest: str | Path, **kwargs) -> "AO2DPairDataset":
+    def from_manifest(cls, manifest: str | Path, data_root: str | Path | None = None, **kwargs) -> "AO2DPairDataset":
         records: list[PairRecord] = []
-        base = Path(manifest).parent
+        manifest = Path(manifest)
+        root = infer_manifest_data_root(manifest, data_root)
         with Path(manifest).open("r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -128,13 +130,11 @@ class AO2DPairDataset(Dataset):
                 coeff = row.get("zernike_path") or row.get("coeff_path") or None
                 if not src or not tgt:
                     continue
-                src_path = Path(src)
-                tgt_path = Path(tgt)
                 records.append(
                     PairRecord(
-                        src_path if src_path.is_absolute() else base / src_path,
-                        tgt_path if tgt_path.is_absolute() else base / tgt_path,
-                        Path(coeff) if coeff else None,
+                        resolve_manifest_record_path(src, root),
+                        resolve_manifest_record_path(tgt, root),
+                        resolve_manifest_record_path(coeff, root) if coeff else None,
                     )
                 )
         return cls(records, **kwargs)

@@ -185,18 +185,20 @@ No_abe/   target corrected images
 
 ## Supervised Training
 
-Edit `configs/supervised_2d.json` so the manifest path points to your dataset:
+Point the code to your dataset root with either `--data-root`, `AO2D_DATA_ROOT`, or
+`data.root`/`data.data_root` in the config. Keep paths inside the config relative to
+that root so the same config works on different machines:
 
 ```json
 "data": {
   "patch_size": [256, 256],
   "train": {
-    "manifest": "/path/to/DATA_ROOT/metadata/manifest.csv",
+    "manifest": "metadata/manifest.csv",
     "augment": true,
     "samples_per_epoch": 1000
   },
   "val": {
-    "manifest": "/path/to/DATA_ROOT/validation/metadata/manifest.csv",
+    "manifest": "validation/metadata/manifest.csv",
     "augment": false,
     "samples_per_epoch": 100
   }
@@ -208,7 +210,15 @@ Run:
 ```bash
 python scripts/train_supervised.py \
   -c configs/supervised_2d.json \
+  --data-root /path/to/DATA_ROOT \
   -o outputs/care2d_supervised
+```
+
+Or set the environment variable once on each server:
+
+```bash
+export AO2D_DATA_ROOT=/path/to/DATA_ROOT
+python scripts/train_supervised.py -c configs/supervised_2d.json -o outputs/care2d_supervised
 ```
 
 Multi-GPU training is supported with `torchrun`:
@@ -216,6 +226,7 @@ Multi-GPU training is supported with `torchrun`:
 ```bash
 torchrun --nproc_per_node=2 scripts/train_supervised.py \
   -c configs/supervised_2d.json \
+  --data-root /mnt/share/dyx/Data/Data2d \
   -o outputs/care2d
 ```
 

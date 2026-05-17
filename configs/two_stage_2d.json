@@ -19,14 +19,14 @@
   "data": {
     "patch_size": [256, 256],
     "train": {
-      "object_dir": "../data/OBJ",
-      "aberrated_dir": "../data/abe",
+      "object_dir": "OBJ",
+      "aberrated_dir": "abe",
       "augment": true,
       "object_samples_per_epoch": 1000,
       "aberrated_samples_per_epoch": 1000
     },
     "val": {
-      "aberrated_dir": "../data/validation/abe",
+      "aberrated_dir": "validation/abe",
       "samples_per_epoch": 100
     }
   },

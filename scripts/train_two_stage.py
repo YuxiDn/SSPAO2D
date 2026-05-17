@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ao2d.data import AO2DSelfDataset, build_dataloader
+from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 from ao2d.optics import AO2DConfig, random_zernike_coefficients
 from ao2d.training import (
@@ -237,10 +237,12 @@ def main() -> None:
     parser.add_argument("-o", "--output", default=None)
     parser.add_argument("--stage", choices=["stage1", "stage2", "both"], default="both")
     parser.add_argument("--resume_stage1", default=None)
+    parser.add_argument("--data-root", default=None, help="Dataset root. Overrides data.root/data.data_root and AO2D_DATA_ROOT.")
     args = parser.parse_args()
 
     ctx = setup_distributed()
     config = read_config(args.config)
+    data_root = get_data_root(config, args.data_root)
     output_dir = Path(args.output or config.get("output_dir", "outputs/two_stage"))
     output_dir.mkdir(parents=True, exist_ok=True)
     if ctx.is_main:
@@ -266,20 +268,20 @@ def main() -> None:
     forward_model = AO2DForwardModel(patch_size, zernike_indices, make_optics_config(config)).to(device)
 
     obj_set = AO2DSelfDataset(
-        config["data"]["train"]["object_dir"],
+        resolve_path(config["data"]["train"]["object_dir"], data_root),
         patch_size=patch_size,
         augment=bool(config["data"]["train"].get("augment", True)),
         samples_per_epoch=config["data"]["train"].get("object_samples_per_epoch"),
     )
     real_set = AO2DSelfDataset(
-        config["data"]["train"]["aberrated_dir"],
+        resolve_path(config["data"]["train"]["aberrated_dir"], data_root),
         patch_size=patch_size,
         augment=bool(config["data"]["train"].get("augment", True)),
         samples_per_epoch=config["data"]["train"].get("aberrated_samples_per_epoch"),
     )
     val_set = (
         AO2DSelfDataset(
-            config["data"]["val"]["aberrated_dir"],
+            resolve_path(config["data"]["val"]["aberrated_dir"], data_root),
             patch_size=patch_size,
             augment=False,
             samples_per_epoch=config["data"]["val"].get("samples_per_epoch"),
