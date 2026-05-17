@@ -19,14 +19,14 @@
   "data": {
     "patch_size": [256, 256],
     "train": {
-      "object_dir": "data/ao2d/OBJ",
-      "aberrated_dir": "data/ao2d/abe",
+      "object_dir": "../data/OBJ",
+      "aberrated_dir": "../data/abe",
       "augment": true,
       "object_samples_per_epoch": 1000,
       "aberrated_samples_per_epoch": 1000
     },
     "val": {
-      "aberrated_dir": "data/ao2d_val/abe",
+      "aberrated_dir": "../data/validation/abe",
       "samples_per_epoch": 100
     }
   },
@@ -51,4 +51,3 @@
     "coeff_l2": 0.0001
   }
 }
-

@@ -5,19 +5,19 @@
     "in_channels": 1,
     "out_channels": 1,
     "base_channels": 32,
-    "depth": 3,
+    "depth": 4,
     "norm": "batch",
     "final_activation": "sigmoid"
   },
   "data": {
-    "patch_size": [256, 256],
+    "patch_size": [512, 512],
     "train": {
-      "manifest": "data/ao2d/metadata/manifest.csv",
+      "manifest": "../data/metadata/manifest.csv",
       "augment": true,
       "samples_per_epoch": 1000
     },
     "val": {
-      "manifest": "data/ao2d_val/metadata/manifest.csv",
+      "manifest": "../data/validation/metadata/manifest.csv",
       "augment": false,
       "samples_per_epoch": 100
     }

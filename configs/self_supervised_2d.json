@@ -23,12 +23,12 @@
   "data": {
     "patch_size": [256, 256],
     "train": {
-      "image_dir": "data/ao2d/abe",
+      "image_dir": "../data/abe",
       "augment": true,
       "samples_per_epoch": 1000
     },
     "val": {
-      "image_dir": "data/ao2d_val/abe",
+      "image_dir": "../data/validation/abe",
       "samples_per_epoch": 100
     }
   },

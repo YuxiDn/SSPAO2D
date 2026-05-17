@@ -137,7 +137,17 @@ DATA_ROOT/
   PSF/abe/
   Zernike/
   metadata/manifest.csv
+  validation/
+    OBJ/
+    No_abe/
+    abe/
+    PSF/No_abe/
+    PSF/abe/
+    Zernike/
+    metadata/manifest.csv
 ```
+
+The top-level folders are used for training. `DATA_ROOT/validation/` is used as a dedicated validation set and should follow the same internal layout.
 
 For supervised training, `metadata/manifest.csv` must contain:
 
@@ -184,6 +194,11 @@ Edit `configs/supervised_2d.json` so the manifest path points to your dataset:
     "manifest": "/path/to/DATA_ROOT/metadata/manifest.csv",
     "augment": true,
     "samples_per_epoch": 1000
+  },
+  "val": {
+    "manifest": "/path/to/DATA_ROOT/validation/metadata/manifest.csv",
+    "augment": false,
+    "samples_per_epoch": 100
   }
 }
 ```
@@ -219,6 +234,10 @@ Edit `configs/self_supervised_2d.json`:
     "image_dir": "/path/to/DATA_ROOT/abe",
     "augment": true,
     "samples_per_epoch": 1000
+  },
+  "val": {
+    "image_dir": "/path/to/DATA_ROOT/validation/abe",
+    "samples_per_epoch": 100
   }
 }
 ```
