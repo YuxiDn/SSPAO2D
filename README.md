@@ -196,6 +196,14 @@ python scripts/train_supervised.py \
   -o outputs/care2d_supervised
 ```
 
+Multi-GPU training is supported with `torchrun`:
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_supervised.py \
+  -c configs/supervised_2d.json \
+  -o outputs/care2d_supervised
+```
+
 The default supervised configuration uses `care2d` as a baseline. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
 
 ## Self-Supervised Training
@@ -219,6 +227,14 @@ Run:
 
 ```bash
 python scripts/train_self_supervised.py \
+  -c configs/self_supervised_2d.json \
+  -o outputs/scare2d_self_supervised
+```
+
+Multi-GPU training:
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_self_supervised.py \
   -c configs/self_supervised_2d.json \
   -o outputs/scare2d_self_supervised
 ```
@@ -308,6 +324,15 @@ python scripts/train_two_stage.py \
   --stage both
 ```
 
+Multi-GPU two-stage training:
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_two_stage.py \
+  -c configs/two_stage_2d.json \
+  -o outputs/picnet2d_two_stage \
+  --stage both
+```
+
 Run only stage 1:
 
 ```bash
@@ -367,4 +392,6 @@ In short, PICNet2D is a more modular physical inverse-modeling framework, while 
 
 - Keep all optical distances and wavelengths in micrometers.
 - Use image patches large enough for the chosen model depth.
+- `batch_size` in config files is the per-process batch size. With `torchrun --nproc_per_node=4`, the effective global batch size is `4 * batch_size`.
+- In distributed training, only rank 0 writes checkpoints and logs.
 - Self-supervised training quality depends strongly on the accuracy of the forward optical model.

@@ -15,7 +15,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ao2d.data import AO2DPairDataset, build_dataloader
 from ao2d.models.factory import make_model
-from ao2d.training import psnr, ssim
+from ao2d.training import (
+    cleanup_distributed,
+    make_sampler,
+    psnr,
+    reduce_metrics,
+    set_sampler_epoch,
+    setup_distributed,
+    unwrap_ddp,
+    wrap_ddp,
+    ssim,
+)
 
 
 def read_config(path: str | Path) -> dict:
@@ -35,11 +45,11 @@ def make_dataset(config: dict, split: str):
     return AO2DPairDataset.from_dirs(data_cfg["aberrated_dir"], data_cfg["target_dir"], **common)
 
 
-def run_epoch(model, loader, optimizer, device, train: bool):
+def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool):
     model.train(train)
     totals = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0}
     with torch.set_grad_enabled(train):
-        for batch in tqdm(loader, desc="train" if train else "val", leave=False):
+        for batch in tqdm(loader, desc="train" if train else "val", leave=False, disable=not show_progress):
             x = batch["input"].to(device, non_blocking=True)
             y = batch["target"].to(device, non_blocking=True)
             out = model(x)
@@ -61,38 +71,69 @@ def main() -> None:
     parser.add_argument("-o", "--output", default=None)
     args = parser.parse_args()
 
+    ctx = setup_distributed()
     config = read_config(args.config)
     output_dir = Path(args.output or config.get("output_dir", "outputs/supervised"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "config.json").write_text(json.dumps(config, indent=2))
+    if ctx.is_main:
+        (output_dir / "config.json").write_text(json.dumps(config, indent=2))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = ctx.device
     model = make_model(config["model"]).to(device)
+    model = wrap_ddp(model, ctx)
     optimizer = AdamW(model.parameters(), lr=float(config["training"].get("lr", 1e-4)), weight_decay=float(config["training"].get("weight_decay", 1e-4)))
 
     train_set = make_dataset(config, "train")
     val_set = make_dataset(config, "val") if "val" in config["data"] else None
-    train_loader = build_dataloader(train_set, int(config["training"].get("batch_size", 4)), True, int(config["training"].get("num_workers", 4)))
-    val_loader = build_dataloader(val_set, int(config["training"].get("batch_size", 4)), False, int(config["training"].get("num_workers", 4))) if val_set else None
+    train_sampler = make_sampler(train_set, ctx, shuffle=True)
+    val_sampler = make_sampler(val_set, ctx, shuffle=False)
+    train_loader = build_dataloader(
+        train_set,
+        int(config["training"].get("batch_size", 4)),
+        train_sampler is None,
+        int(config["training"].get("num_workers", 4)),
+        sampler=train_sampler,
+        drop_last=True,
+    )
+    val_loader = (
+        build_dataloader(
+            val_set,
+            int(config["training"].get("batch_size", 4)),
+            False,
+            int(config["training"].get("num_workers", 4)),
+            sampler=val_sampler,
+            drop_last=False,
+        )
+        if val_set
+        else None
+    )
 
     best = float("inf")
     epochs = int(config["training"].get("epochs", 100))
-    for epoch in range(1, epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, device, train=True)
-        val_metrics = run_epoch(model, val_loader, optimizer, device, train=False) if val_loader else train_metrics
-        print(f"epoch={epoch:04d} train={train_metrics} val={val_metrics}")
+    try:
+        for epoch in range(1, epochs + 1):
+            set_sampler_epoch(train_sampler, epoch)
+            set_sampler_epoch(val_sampler, epoch)
+            train_metrics = run_epoch(model, train_loader, optimizer, device, train=True, show_progress=ctx.is_main)
+            val_metrics = run_epoch(model, val_loader, optimizer, device, train=False, show_progress=ctx.is_main) if val_loader else train_metrics
+            train_metrics = reduce_metrics(train_metrics, ctx)
+            val_metrics = reduce_metrics(val_metrics, ctx)
+            if ctx.is_main:
+                print(f"epoch={epoch:04d} train={train_metrics} val={val_metrics}")
 
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": config,
-            "val": val_metrics,
-        }
-        torch.save(ckpt, output_dir / "last.pt")
-        if val_metrics["loss"] < best:
-            best = val_metrics["loss"]
-            torch.save(ckpt, output_dir / "best.pt")
+                ckpt = {
+                    "epoch": epoch,
+                    "model": unwrap_ddp(model).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": config,
+                    "val": val_metrics,
+                }
+                torch.save(ckpt, output_dir / "last.pt")
+                if val_metrics["loss"] < best:
+                    best = val_metrics["loss"]
+                    torch.save(ckpt, output_dir / "best.pt")
+    finally:
+        cleanup_distributed(ctx)
 
 
 if __name__ == "__main__":

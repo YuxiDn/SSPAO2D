@@ -17,7 +17,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ao2d.data import AO2DSelfDataset, build_dataloader
 from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 from ao2d.optics import AO2DConfig, random_zernike_coefficients
-from ao2d.training import AO2DForwardModel, psnr, ssim, total_variation_2d
+from ao2d.training import (
+    AO2DForwardModel,
+    cleanup_distributed,
+    make_sampler,
+    psnr,
+    reduce_metrics,
+    set_sampler_epoch,
+    setup_distributed,
+    ssim,
+    total_variation_2d,
+    unwrap_ddp,
+    wrap_ddp,
+)
 
 
 def read_config(path: str | Path) -> dict:
@@ -79,14 +91,14 @@ def make_models(config: dict, device: torch.device) -> tuple[OBJGenerator2D, Abe
     return obj_net.to(device), coeff_net.to(device)
 
 
-def train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer, device, config):
+def train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer, device, config, show_progress: bool):
     obj_net.train()
     coeff_net.train()
     weights = config["training"]
     use_sqrt = bool(weights.get("sqrt_intensity_loss", False))
     totals = {"loss": 0.0, "loss_cycle": 0.0, "loss_object": 0.0, "loss_coeff": 0.0}
 
-    for batch in tqdm(obj_loader, desc="stage1", leave=False):
+    for batch in tqdm(obj_loader, desc="stage1", leave=False, disable=not show_progress):
         obj = batch["input"].to(device, non_blocking=True)
         coeff_gt = sample_coefficients(obj.shape[0], config, device)
         synth_abe = forward_model(obj, coeff_gt).detach()
@@ -116,7 +128,7 @@ def train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer,
     return {k: v / max(1, len(obj_loader)) for k, v in totals.items()}
 
 
-def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loader, optimizer, device, config):
+def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loader, optimizer, device, config, show_progress: bool):
     obj_net.train()
     coeff_net.train()
     obj_iter = iter(obj_loader)
@@ -132,7 +144,7 @@ def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loade
         "loss_synth_coeff": 0.0,
     }
 
-    for real_batch in tqdm(real_loader, desc="stage2", leave=False):
+    for real_batch in tqdm(real_loader, desc="stage2", leave=False, disable=not show_progress):
         real_abe = real_batch["input"].to(device, non_blocking=True)
         try:
             obj_batch = next(obj_iter)
@@ -177,14 +189,14 @@ def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loade
     return {k: v / max(1, len(real_loader)) for k, v in totals.items()}
 
 
-def validate(obj_net, coeff_net, forward_model, loader, device):
+def validate(obj_net, coeff_net, forward_model, loader, device, show_progress: bool):
     if loader is None:
         return None
     obj_net.eval()
     coeff_net.eval()
     totals = {"loss": 0.0, "cycle_psnr": 0.0, "cycle_ssim": 0.0}
     with torch.no_grad():
-        for batch in tqdm(loader, desc="val", leave=False):
+        for batch in tqdm(loader, desc="val", leave=False, disable=not show_progress):
             x = batch["input"].to(device, non_blocking=True)
             pred_obj = obj_net(x)
             pred_coeff = coeff_net(x)
@@ -200,8 +212,8 @@ def save_checkpoint(path: Path, epoch: int, obj_net, coeff_net, optimizer, confi
     torch.save(
         {
             "epoch": epoch,
-            "object_generator": obj_net.state_dict(),
-            "aberration_generator": coeff_net.state_dict(),
+            "object_generator": unwrap_ddp(obj_net).state_dict(),
+            "aberration_generator": unwrap_ddp(coeff_net).state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": config,
             "metrics": metrics,
@@ -227,13 +239,21 @@ def main() -> None:
     parser.add_argument("--resume_stage1", default=None)
     args = parser.parse_args()
 
+    ctx = setup_distributed()
     config = read_config(args.config)
     output_dir = Path(args.output or config.get("output_dir", "outputs/two_stage"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "config.json").write_text(json.dumps(config, indent=2))
+    if ctx.is_main:
+        (output_dir / "config.json").write_text(json.dumps(config, indent=2))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = ctx.device
     obj_net, coeff_net = make_models(config, device)
+    if args.resume_stage1:
+        start_epoch = load_stage1(args.resume_stage1, obj_net, coeff_net)
+        if ctx.is_main:
+            print(f"Loaded stage-1 checkpoint from epoch {start_epoch}: {args.resume_stage1}")
+    obj_net = wrap_ddp(obj_net, ctx)
+    coeff_net = wrap_ddp(coeff_net, ctx)
     params = list(obj_net.parameters()) + list(coeff_net.parameters())
     optimizer = AdamW(
         params,
@@ -270,38 +290,48 @@ def main() -> None:
 
     batch_size = int(config["training"].get("batch_size", 4))
     num_workers = int(config["training"].get("num_workers", 4))
-    obj_loader = build_dataloader(obj_set, batch_size, True, num_workers)
-    real_loader = build_dataloader(real_set, batch_size, True, num_workers)
-    val_loader = build_dataloader(val_set, batch_size, False, num_workers) if val_set else None
+    obj_sampler = make_sampler(obj_set, ctx, shuffle=True)
+    real_sampler = make_sampler(real_set, ctx, shuffle=True)
+    val_sampler = make_sampler(val_set, ctx, shuffle=False)
+    obj_loader = build_dataloader(obj_set, batch_size, obj_sampler is None, num_workers, sampler=obj_sampler, drop_last=True)
+    real_loader = build_dataloader(real_set, batch_size, real_sampler is None, num_workers, sampler=real_sampler, drop_last=True)
+    val_loader = build_dataloader(val_set, batch_size, False, num_workers, sampler=val_sampler, drop_last=False) if val_set else None
 
     best = float("inf")
-    if args.resume_stage1:
-        start_epoch = load_stage1(args.resume_stage1, obj_net, coeff_net)
-        print(f"Loaded stage-1 checkpoint from epoch {start_epoch}: {args.resume_stage1}")
+    try:
+        if args.stage in {"stage1", "both"}:
+            for epoch in range(1, int(config["training"].get("epochs_stage1", 50)) + 1):
+                set_sampler_epoch(obj_sampler, epoch)
+                metrics = train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer, device, config, show_progress=ctx.is_main)
+                metrics = reduce_metrics(metrics, ctx)
+                if ctx.is_main:
+                    print(f"stage=1 epoch={epoch:04d} train={metrics}")
+                    save_checkpoint(output_dir / "stage1_last.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
+                    if metrics["loss"] < best:
+                        best = metrics["loss"]
+                        save_checkpoint(output_dir / "stage1_best.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
 
-    if args.stage in {"stage1", "both"}:
-        for epoch in range(1, int(config["training"].get("epochs_stage1", 50)) + 1):
-            metrics = train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer, device, config)
-            print(f"stage=1 epoch={epoch:04d} train={metrics}")
-            save_checkpoint(output_dir / "stage1_last.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
-            if metrics["loss"] < best:
-                best = metrics["loss"]
-                save_checkpoint(output_dir / "stage1_best.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
-
-    if args.stage in {"stage2", "both"}:
-        for group in optimizer.param_groups:
-            group["lr"] = float(config["training"].get("lr_stage2", config["training"].get("lr", 1e-4) * 0.1))
-        best = float("inf")
-        for epoch in range(1, int(config["training"].get("epochs_stage2", 100)) + 1):
-            train_metrics = train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loader, optimizer, device, config)
-            val_metrics = validate(obj_net, coeff_net, forward_model, val_loader, device) or train_metrics
-            print(f"stage=2 epoch={epoch:04d} train={train_metrics} val={val_metrics}")
-            save_checkpoint(output_dir / "stage2_last.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
-            if val_metrics["loss"] < best:
-                best = val_metrics["loss"]
-                save_checkpoint(output_dir / "stage2_best.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
+        if args.stage in {"stage2", "both"}:
+            for group in optimizer.param_groups:
+                group["lr"] = float(config["training"].get("lr_stage2", config["training"].get("lr", 1e-4) * 0.1))
+            best = float("inf")
+            for epoch in range(1, int(config["training"].get("epochs_stage2", 100)) + 1):
+                set_sampler_epoch(obj_sampler, epoch)
+                set_sampler_epoch(real_sampler, epoch)
+                set_sampler_epoch(val_sampler, epoch)
+                train_metrics = train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loader, optimizer, device, config, show_progress=ctx.is_main)
+                val_metrics = validate(obj_net, coeff_net, forward_model, val_loader, device, show_progress=ctx.is_main) or train_metrics
+                train_metrics = reduce_metrics(train_metrics, ctx)
+                val_metrics = reduce_metrics(val_metrics, ctx)
+                if ctx.is_main:
+                    print(f"stage=2 epoch={epoch:04d} train={train_metrics} val={val_metrics}")
+                    save_checkpoint(output_dir / "stage2_last.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
+                    if val_metrics["loss"] < best:
+                        best = val_metrics["loss"]
+                        save_checkpoint(output_dir / "stage2_best.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
+    finally:
+        cleanup_distributed(ctx)
 
 
 if __name__ == "__main__":
     main()
-

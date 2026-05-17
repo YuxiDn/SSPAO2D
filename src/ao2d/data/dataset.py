@@ -8,7 +8,7 @@ from typing import Callable
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .io import IMAGE_EXTENSIONS, load_image, normalize01
 
@@ -143,7 +143,7 @@ class AO2DPairDataset(Dataset):
         return self.samples_per_epoch or len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        record = self.records[index % len(self.records)] if self.samples_per_epoch is None else random.choice(self.records)
+        record = self.records[index % len(self.records)]
         x = normalize01(load_image(record.aberrated), self.normalize_percentile)
         y = normalize01(load_image(record.target), self.normalize_percentile)
         x, y = _random_crop_pair(x, y, self.patch_size)
@@ -180,7 +180,7 @@ class AO2DSelfDataset(Dataset):
         return self.samples_per_epoch or len(self.files)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        path = self.files[index % len(self.files)] if self.samples_per_epoch is None else random.choice(self.files)
+        path = self.files[index % len(self.files)]
         x = normalize01(load_image(path), self.normalize_percentile)
         x = _random_crop_single(x, self.patch_size)
         if self.augment:
@@ -188,13 +188,20 @@ class AO2DSelfDataset(Dataset):
         return {"input": _to_tensor(x), "input_path": str(path)}
 
 
-def build_dataloader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 4) -> DataLoader:
+def build_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 4,
+    sampler: Sampler | None = None,
+    drop_last: bool | None = None,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=shuffle,
+        drop_last=shuffle if drop_last is None else drop_last,
     )
-
