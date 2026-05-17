@@ -1,2 +1,25 @@
 .*
 !.gitignore
+# training outputs
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+__pycache__/
+*.pyc
+
+# Python cache/build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+src/*.egg-info/
+
+# training outputs/checkpoints
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
