@@ -1,0 +1,44 @@
+{
+  "output_dir": "outputs/self_supervised_2d",
+  "model": {
+    "name": "scare2d",
+    "in_channels": 1,
+    "out_channels": 1,
+    "base_channels": 32,
+    "depth": 3,
+    "norm": "batch",
+    "final_activation": "sigmoid",
+    "zernike_modes": 13,
+    "zernike_hidden": 128,
+    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  },
+  "optics": {
+    "pixel_size": 0.300,
+    "na": 1.05,
+    "lambda_emission": 1.000,
+    "lambda_excitation": 0.808,
+    "mode": "widefield",
+    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  },
+  "data": {
+    "patch_size": [256, 256],
+    "train": {
+      "image_dir": "data/ao2d/abe",
+      "augment": true,
+      "samples_per_epoch": 1000
+    },
+    "val": {
+      "image_dir": "data/ao2d_val/abe",
+      "samples_per_epoch": 100
+    }
+  },
+  "training": {
+    "epochs": 100,
+    "batch_size": 4,
+    "num_workers": 4,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "tv_weight": 0.00001,
+    "coeff_l2": 0.0001
+  }
+}
