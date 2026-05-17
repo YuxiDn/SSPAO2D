@@ -9,7 +9,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,12 +18,17 @@ from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 from ao2d.optics import AO2DConfig, random_zernike_coefficients
 from ao2d.training import (
     AO2DForwardModel,
+    build_optimizer,
+    build_scheduler,
     cleanup_distributed,
+    get_current_lr,
     make_sampler,
     psnr,
     reduce_metrics,
     set_sampler_epoch,
+    set_optimizer_lr,
     setup_distributed,
+    step_scheduler,
     ssim,
     total_variation_2d,
     unwrap_ddp,
@@ -208,13 +212,14 @@ def validate(obj_net, coeff_net, forward_model, loader, device, show_progress: b
     return {k: v / max(1, len(loader)) for k, v in totals.items()}
 
 
-def save_checkpoint(path: Path, epoch: int, obj_net, coeff_net, optimizer, config: dict, metrics: dict) -> None:
+def save_checkpoint(path: Path, epoch: int, obj_net, coeff_net, optimizer, scheduler, config: dict, metrics: dict) -> None:
     torch.save(
         {
             "epoch": epoch,
             "object_generator": unwrap_ddp(obj_net).state_dict(),
             "aberration_generator": unwrap_ddp(coeff_net).state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "config": config,
             "metrics": metrics,
         },
@@ -257,11 +262,7 @@ def main() -> None:
     obj_net = wrap_ddp(obj_net, ctx)
     coeff_net = wrap_ddp(coeff_net, ctx)
     params = list(obj_net.parameters()) + list(coeff_net.parameters())
-    optimizer = AdamW(
-        params,
-        lr=float(config["training"].get("lr_stage1", config["training"].get("lr", 1e-4))),
-        weight_decay=float(config["training"].get("weight_decay", 1e-4)),
-    )
+    optimizer = build_optimizer(params, config["training"], prefix="stage1")
 
     patch_size = tuple(config["data"].get("patch_size", [256, 256]))
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
@@ -302,22 +303,29 @@ def main() -> None:
     best = float("inf")
     try:
         if args.stage in {"stage1", "both"}:
-            for epoch in range(1, int(config["training"].get("epochs_stage1", 50)) + 1):
+            epochs_stage1 = int(config["training"].get("epochs_stage1", 50))
+            scheduler_stage1 = build_scheduler(optimizer, config["training"], total_epochs=epochs_stage1, prefix="stage1")
+            for epoch in range(1, epochs_stage1 + 1):
                 set_sampler_epoch(obj_sampler, epoch)
                 metrics = train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer, device, config, show_progress=ctx.is_main)
                 metrics = reduce_metrics(metrics, ctx)
+                step_scheduler(scheduler_stage1, metrics["loss"])
+                lr = get_current_lr(optimizer)
                 if ctx.is_main:
-                    print(f"stage=1 epoch={epoch:04d} train={metrics}")
-                    save_checkpoint(output_dir / "stage1_last.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
+                    print(f"stage=1 epoch={epoch:04d} lr={lr:.6g} train={metrics}")
+                    save_checkpoint(output_dir / "stage1_last.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage1, config, metrics)
                     if metrics["loss"] < best:
                         best = metrics["loss"]
-                        save_checkpoint(output_dir / "stage1_best.pt", epoch, obj_net, coeff_net, optimizer, config, metrics)
+                        save_checkpoint(output_dir / "stage1_best.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage1, config, metrics)
 
         if args.stage in {"stage2", "both"}:
-            for group in optimizer.param_groups:
-                group["lr"] = float(config["training"].get("lr_stage2", config["training"].get("lr", 1e-4) * 0.1))
+            stage1_lr = float(config["training"].get("lr_stage1", config["training"].get("initial_learning_rate", config["training"].get("lr", 1e-4))))
+            stage2_lr = float(config["training"].get("lr_stage2", stage1_lr * float(config["training"].get("stage2_lr_scale", 0.1))))
+            set_optimizer_lr(optimizer, stage2_lr)
             best = float("inf")
-            for epoch in range(1, int(config["training"].get("epochs_stage2", 100)) + 1):
+            epochs_stage2 = int(config["training"].get("epochs_stage2", 100))
+            scheduler_stage2 = build_scheduler(optimizer, config["training"], total_epochs=epochs_stage2, prefix="stage2")
+            for epoch in range(1, epochs_stage2 + 1):
                 set_sampler_epoch(obj_sampler, epoch)
                 set_sampler_epoch(real_sampler, epoch)
                 set_sampler_epoch(val_sampler, epoch)
@@ -325,12 +333,14 @@ def main() -> None:
                 val_metrics = validate(obj_net, coeff_net, forward_model, val_loader, device, show_progress=ctx.is_main) or train_metrics
                 train_metrics = reduce_metrics(train_metrics, ctx)
                 val_metrics = reduce_metrics(val_metrics, ctx)
+                step_scheduler(scheduler_stage2, val_metrics["loss"])
+                lr = get_current_lr(optimizer)
                 if ctx.is_main:
-                    print(f"stage=2 epoch={epoch:04d} train={train_metrics} val={val_metrics}")
-                    save_checkpoint(output_dir / "stage2_last.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
+                    print(f"stage=2 epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")
+                    save_checkpoint(output_dir / "stage2_last.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage2, config, val_metrics)
                     if val_metrics["loss"] < best:
                         best = val_metrics["loss"]
-                        save_checkpoint(output_dir / "stage2_best.pt", epoch, obj_net, coeff_net, optimizer, config, val_metrics)
+                        save_checkpoint(output_dir / "stage2_best.pt", epoch, obj_net, coeff_net, optimizer, scheduler_stage2, config, val_metrics)
     finally:
         cleanup_distributed(ctx)
 

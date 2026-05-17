@@ -8,7 +8,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -18,12 +17,16 @@ from ao2d.models.factory import make_model
 from ao2d.optics import AO2DConfig
 from ao2d.training import (
     AO2DForwardModel,
+    build_optimizer,
+    build_scheduler,
     cleanup_distributed,
+    get_current_lr,
     make_sampler,
     psnr,
     reduce_metrics,
     set_sampler_epoch,
     setup_distributed,
+    step_scheduler,
     ssim,
     total_variation_2d,
     unwrap_ddp,
@@ -91,7 +94,9 @@ def main() -> None:
     device = ctx.device
     model = make_model(config["model"]).to(device)
     model = wrap_ddp(model, ctx)
-    optimizer = AdamW(model.parameters(), lr=float(config["training"].get("lr", 1e-4)), weight_decay=float(config["training"].get("weight_decay", 1e-4)))
+    optimizer = build_optimizer(model.parameters(), config["training"])
+    epochs = int(config["training"].get("epochs", 100))
+    scheduler = build_scheduler(optimizer, config["training"], total_epochs=epochs)
 
     image_size = tuple(config["data"].get("patch_size", [256, 256]))
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
@@ -134,16 +139,25 @@ def main() -> None:
 
     best = float("inf")
     try:
-        for epoch in range(1, int(config["training"].get("epochs", 100)) + 1):
+        for epoch in range(1, epochs + 1):
             set_sampler_epoch(train_sampler, epoch)
             set_sampler_epoch(val_sampler, epoch)
             train_metrics = run_epoch(model, forward_model, train_loader, optimizer, device, config, train=True, show_progress=ctx.is_main)
             val_metrics = run_epoch(model, forward_model, val_loader, optimizer, device, config, train=False, show_progress=ctx.is_main) if val_loader else train_metrics
             train_metrics = reduce_metrics(train_metrics, ctx)
             val_metrics = reduce_metrics(val_metrics, ctx)
+            step_scheduler(scheduler, val_metrics["loss"])
+            lr = get_current_lr(optimizer)
             if ctx.is_main:
-                print(f"epoch={epoch:04d} train={train_metrics} val={val_metrics}")
-                ckpt = {"epoch": epoch, "model": unwrap_ddp(model).state_dict(), "optimizer": optimizer.state_dict(), "config": config, "val": val_metrics}
+                print(f"epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")
+                ckpt = {
+                    "epoch": epoch,
+                    "model": unwrap_ddp(model).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "config": config,
+                    "val": val_metrics,
+                }
                 torch.save(ckpt, output_dir / "last.pt")
                 if val_metrics["loss"] < best:
                     best = val_metrics["loss"]

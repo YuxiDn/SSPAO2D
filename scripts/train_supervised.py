@@ -8,7 +8,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -16,12 +15,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ao2d.data import AO2DPairDataset, build_dataloader, get_data_root, resolve_path
 from ao2d.models.factory import make_model
 from ao2d.training import (
+    build_optimizer,
+    build_scheduler,
     cleanup_distributed,
+    get_current_lr,
     make_sampler,
     psnr,
     reduce_metrics,
     set_sampler_epoch,
     setup_distributed,
+    step_scheduler,
     unwrap_ddp,
     wrap_ddp,
     ssim,
@@ -88,7 +91,9 @@ def main() -> None:
     device = ctx.device
     model = make_model(config["model"]).to(device)
     model = wrap_ddp(model, ctx)
-    optimizer = AdamW(model.parameters(), lr=float(config["training"].get("lr", 1e-4)), weight_decay=float(config["training"].get("weight_decay", 1e-4)))
+    optimizer = build_optimizer(model.parameters(), config["training"])
+    epochs = int(config["training"].get("epochs", 100))
+    scheduler = build_scheduler(optimizer, config["training"], total_epochs=epochs)
 
     train_set = make_dataset(config, "train", data_root)
     val_set = make_dataset(config, "val", data_root) if "val" in config["data"] else None
@@ -116,7 +121,6 @@ def main() -> None:
     )
 
     best = float("inf")
-    epochs = int(config["training"].get("epochs", 100))
     try:
         for epoch in range(1, epochs + 1):
             set_sampler_epoch(train_sampler, epoch)
@@ -125,13 +129,16 @@ def main() -> None:
             val_metrics = run_epoch(model, val_loader, optimizer, device, train=False, show_progress=ctx.is_main) if val_loader else train_metrics
             train_metrics = reduce_metrics(train_metrics, ctx)
             val_metrics = reduce_metrics(val_metrics, ctx)
+            step_scheduler(scheduler, val_metrics["loss"])
+            lr = get_current_lr(optimizer)
             if ctx.is_main:
-                print(f"epoch={epoch:04d} train={train_metrics} val={val_metrics}")
+                print(f"epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")
 
                 ckpt = {
                     "epoch": epoch,
                     "model": unwrap_ddp(model).state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
                     "config": config,
                     "val": val_metrics,
                 }

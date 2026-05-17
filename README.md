@@ -232,6 +232,20 @@ torchrun --nproc_per_node=2 scripts/train_supervised.py \
 
 The default supervised configuration uses `care2d` as a baseline. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
 
+Optimizer and learning-rate decay are configured in the `training` block. The field names are compatible with the original SSPAO configs. The supervised baseline uses Adam with StepLR by default:
+
+```json
+"training": {
+  "optimizer": "Adam",
+  "initial_learning_rate": 0.0001,
+  "lr_scheduler": "StepLR",
+  "step_size": 25,
+  "gamma": 0.5
+}
+```
+
+Supported optimizers are `Adam`, `AdamW`, and `SGD`. Supported schedulers are `StepLR`, `CosineAnnealingLR`, `MultiStepLR`, `ReduceLROnPlateau`, and `none`. The shorter names `step`, `cosine`, `multistep`, and `plateau` are also accepted.
+
 ## Self-Supervised Training
 
 Self-supervised training only requires aberrated input images. The default self-supervised model is SCARE2D, which predicts both a restored image and Zernike coefficients. PICNet2D also satisfies this output interface and can be used as a baseline.
@@ -291,6 +305,19 @@ $$
 + \lambda_c\left\|\hat{\mathbf{c}}\right\|_2^2.
 $$
 
+The default SCARE2D self-supervised config follows the SSPAO SCARE training logic:
+
+```json
+"training": {
+  "optimizer": "Adam",
+  "initial_learning_rate": 0.0001,
+  "lr_scheduler": "ReduceLROnPlateau",
+  "factor": 0.5,
+  "patience": 15,
+  "min_lr": 0.000004
+}
+```
+
 ## Two-Stage Training
 
 `train_two_stage.py` implements a PICNet2D-style baseline. It trains two networks:
@@ -329,6 +356,21 @@ $$
 + \lambda_{\mathrm{TV}}\mathrm{TV}(\hat{x})
 + \lambda_c\left\|\hat{\mathbf{c}}\right\|_2^2.
 $$
+
+Two-stage training has separate learning-rate fields for the two phases:
+
+```json
+"training": {
+  "optimizer": "Adam",
+  "initial_learning_rate": 0.0001,
+  "stage2_lr_scale": 0.1,
+  "lr_scheduler_stage1": "StepLR",
+  "lr_scheduler_stage2": "StepLR",
+  "step_size_stage1": 12,
+  "step_size_stage2": 25,
+  "gamma": 0.5
+}
+```
 
 Use this route when clean object images are available and you want a stronger synthetic-supervision baseline.
 
