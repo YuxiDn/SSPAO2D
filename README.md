@@ -9,10 +9,11 @@ The code is organized for 2-D image workflows while keeping model families commo
 - 2-D optical forward model with Zernike wavefront aberrations.
 - PSF generation from OSA/ANSI Zernike coefficients.
 - Supervised training for `aberrated -> corrected` image restoration.
-- Self-supervised training through `restored image + predicted Zernike coefficients -> re-aberrated image`.
-- Multiple 2-D baseline models:
-  - CARE2D
+- Self-supervised training through an optical reconstruction cycle.
+- Proposed model:
   - SCARE2D
+- Baseline models:
+  - CARE2D
   - RCAN2D
   - DFCAN2D
   - SFENet2D
@@ -24,7 +25,7 @@ The code is organized for 2-D image workflows while keeping model families commo
 src/ao2d/
   optics/        PSF, Zernike, wavefront, and FFT image formation
   data/          image I/O, paired datasets, and self-supervised datasets
-  models/        CARE2D, SCARE2D, RCAN2D, DFCAN2D, SFENet2D, PICNet2D
+  models/        SCARE2D and 2-D baseline models
   training/      forward model, losses, PSNR, and SSIM
 
 scripts/
@@ -52,20 +53,26 @@ python -m pip install -e .
 
 The scripts also insert `src/` into `PYTHONPATH`, so they can be run directly from the repository root during development.
 
-## Model Selection
+## Models
 
 All models can be created through one factory function:
 
 ```python
 from ao2d.models.factory import make_model
 
-model = make_model({"name": "rcan2d"})
+model = make_model({"name": "scare2d"})
 ```
 
-Supported model names:
+The proposed model is:
 
 ```text
-care2d, scare2d, rcan2d, dfcan2d, sfenet2d, picnet2d
+scare2d
+```
+
+Baseline model names:
+
+```text
+care2d, rcan2d, dfcan2d, sfenet2d, picnet2d
 ```
 
 Model configuration examples are provided in `configs/model_*.json`.
@@ -79,20 +86,39 @@ Main conventions:
 - Zernike modes use OSA/ANSI single-index notation.
 - Default Zernike indices are `3:15`, excluding piston, tip, and tilt.
 - Zernike coefficients represent optical path difference amplitudes in micrometers.
+- The wavefront is represented as a weighted Zernike expansion:
+
+$$
+W(\rho,\theta)=\sum_{j \in \mathcal{J}} c_j Z_j(\rho,\theta),
+$$
+
+where \(c_j\) is the optical path difference coefficient in micrometers and \(\mathcal{J}=\{3,\ldots,15\}\) by default.
+
 - Wavefront phase is computed as:
 
-```text
-phase = 2*pi/lambda * wavefront
-```
+$$
+\phi(\rho,\theta)=\frac{2\pi}{\lambda}W(\rho,\theta).
+$$
 
 - The scalar 2-D PSF is generated from a circular pupil in frequency space:
 
-```text
-field = fftshift(ifft2(ifftshift(pupil)))
-psf = abs(field)^2
-```
+$$
+P(\rho,\theta)=A(\rho)\exp\left(i\phi(\rho,\theta)\right),
+$$
+
+$$
+E=\mathcal{F}^{-1}\{P\},
+\qquad
+h=\frac{|E|^2}{\sum |E|^2}.
+$$
 
 - Image formation uses FFT convolution with `ifftshift(psf)`.
+
+For an object image \(x\) and PSF \(h\), the aberrated image is modeled as:
+
+$$
+y = x * h.
+$$
 
 ## Dataset Format
 
@@ -111,13 +137,32 @@ DATA_ROOT/
   metadata/manifest.csv
 ```
 
-For supervised training, `metadata/manifest.csv` must contain at least:
+For supervised training, `metadata/manifest.csv` must contain:
+
+| Column | Required | Description |
+| --- | --- | --- |
+| `abe_path` | yes | Path to the aberrated input image. |
+| `no_abe_path` | yes | Path to the corrected or no-aberration target image. |
+| `object_path` | no | Path to the underlying object image, if available. |
+| `zernike_path` | no | Path to a coefficient file, if available. |
+| `psf_abe_path` | no | Path to the aberrated PSF file. |
+| `psf_no_abe_path` | no | Path to the no-aberration PSF file. |
+| `rms_waves` | no | Aberration RMS level in waves. |
+| `rms_nm` | no | Aberration RMS level in nanometers. |
+| `mode` | no | Microscopy mode, e.g. `widefield`. |
+| `pixel_size_um` | no | Pixel size in micrometers. |
+| `na` | no | Numerical aperture. |
+| `lambda_em_um` | no | Emission wavelength in micrometers. |
+| `lambda_ex_um` | no | Excitation wavelength in micrometers. |
+
+Minimal example:
 
 ```text
 abe_path,no_abe_path
+data/ao2d/abe/sample_001.tif,data/ao2d/No_abe/sample_001.tif
 ```
 
-Optional columns such as `zernike_path`, `psf_abe_path`, and `rms_waves` can be included for bookkeeping.
+Paths may be absolute or relative to the manifest directory.
 
 If no manifest is available, paired directory loading can be used with:
 
@@ -149,11 +194,11 @@ python scripts/train_supervised.py \
   -o outputs/care2d_supervised
 ```
 
-The default supervised model is `care2d`. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
+The default supervised configuration uses `care2d` as a baseline. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
 
 ## Self-Supervised Training
 
-Self-supervised training only requires aberrated input images. Models used in this mode must return both a restored image and Zernike coefficients; `scare2d` and `picnet2d` satisfy this interface.
+Self-supervised training only requires aberrated input images. The default self-supervised model is SCARE2D, which predicts both a restored image and Zernike coefficients. PICNet2D also satisfies this output interface and can be used as a baseline.
 
 Edit `configs/self_supervised_2d.json`:
 
@@ -176,14 +221,27 @@ python scripts/train_self_supervised.py \
   -o outputs/scare2d_self_supervised
 ```
 
-Training objective:
+For an aberrated input \(y\), SCARE2D predicts a restored image \(\hat{x}\) and Zernike coefficients \(\hat{\mathbf{c}}\):
 
-```text
-aberrated image
-  -> model -> restored image + Zernike coefficients
-  -> AO forward model -> estimated aberrated image
-  -> loss(estimated aberrated, input aberrated)
-```
+$$
+(\hat{x},\hat{\mathbf{c}})=f_\theta(y).
+$$
+
+The predicted coefficients generate a PSF \(h(\hat{\mathbf{c}})\), which re-aberrates the restored image:
+
+$$
+\hat{y}=\hat{x} * h(\hat{\mathbf{c}}).
+$$
+
+The self-supervised reconstruction loss is:
+
+$$
+\mathcal{L}_{\mathrm{self}}
+=
+\left\|\hat{y}-y\right\|_1
++ \lambda_{\mathrm{TV}}\mathrm{TV}(\hat{x})
++ \lambda_c\left\|\hat{\mathbf{c}}\right\|_2^2.
+$$
 
 ## Inference
 
@@ -196,12 +254,13 @@ python scripts/test.py \
 
 If the model predicts Zernike coefficients, `test.py` also saves `*_zernike_coeff_um.txt`.
 
-## PICNet2D vs SCARE2D
+## PICNet2D Baseline vs SCARE2D
 
-PICNet2D and SCARE2D both support physics-guided adaptive optics restoration, but their modeling assumptions are different.
+SCARE2D is the proposed model in this codebase. PICNet2D is included as a baseline with a more modular inverse-modeling design.
 
 | Aspect | PICNet2D | SCARE2D |
 | --- | --- | --- |
+| Role in this repository | Baseline | Proposed model |
 | Network structure | Separate object generator and aberration regressor | One restoration backbone with a Zernike regression branch |
 | Output | Restored image and predicted Zernike coefficients | Restored image and predicted Zernike coefficients |
 | Training style | Suits staged or hybrid training with synthetic supervision and physical consistency | Suits direct end-to-end self-supervised training |
@@ -215,4 +274,3 @@ In short, PICNet2D is a more modular physical inverse-modeling framework, while 
 - Keep all optical distances and wavelengths in micrometers.
 - Use image patches large enough for the chosen model depth.
 - Self-supervised training quality depends strongly on the accuracy of the forward optical model.
-
