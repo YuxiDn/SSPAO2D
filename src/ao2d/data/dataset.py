@@ -54,6 +54,47 @@ def _random_crop_pair(x: np.ndarray, y: np.ndarray, patch_size: tuple[int, int] 
     return x[top : top + ph, left : left + pw], y[top : top + ph, left : left + pw]
 
 
+def _normalize_pair01(
+    x: np.ndarray,
+    y: np.ndarray,
+    percentile: tuple[float, float] | None = (0.1, 99.9),
+) -> tuple[np.ndarray, np.ndarray]:
+    x = x.astype(np.float32, copy=False)
+    y = y.astype(np.float32, copy=False)
+    values = np.concatenate([x.reshape(-1), y.reshape(-1)])
+    if percentile is not None:
+        lo, hi = np.percentile(values, percentile)
+    else:
+        lo, hi = float(np.min(values)), float(np.max(values))
+    denom = max(float(hi - lo), np.finfo(np.float32).eps)
+    x = np.clip(x, lo, hi)
+    y = np.clip(y, lo, hi)
+    return ((x - lo) / denom).astype(np.float32), ((y - lo) / denom).astype(np.float32)
+
+
+def _foreground_fraction(x: np.ndarray, threshold: float) -> float:
+    return float((x > threshold).mean())
+
+
+def _random_foreground_crop_pair(
+    x: np.ndarray,
+    y: np.ndarray,
+    patch_size: tuple[int, int] | None,
+    min_foreground_fraction: float | None,
+    foreground_threshold: float,
+    max_patch_tries: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if patch_size is None or min_foreground_fraction is None or min_foreground_fraction <= 0:
+        return _random_crop_pair(x, y, patch_size)
+
+    crop_x, crop_y = _random_crop_pair(x, y, patch_size)
+    for _ in range(max(1, max_patch_tries)):
+        if _foreground_fraction(crop_y, foreground_threshold) >= min_foreground_fraction:
+            return crop_x, crop_y
+        crop_x, crop_y = _random_crop_pair(x, y, patch_size)
+    return crop_x, crop_y
+
+
 def _random_crop_single(x: np.ndarray, patch_size: tuple[int, int] | None) -> np.ndarray:
     if patch_size is None:
         return x
@@ -87,6 +128,9 @@ class AO2DPairDataset(Dataset):
         augment: bool = True,
         samples_per_epoch: int | None = None,
         normalize_percentile: tuple[float, float] | None = (0.1, 99.9),
+        min_foreground_fraction: float | None = None,
+        foreground_threshold: float = 0.03,
+        max_patch_tries: int = 20,
     ) -> None:
         if not records:
             raise ValueError("AO2DPairDataset received no records.")
@@ -95,6 +139,9 @@ class AO2DPairDataset(Dataset):
         self.augment = augment
         self.samples_per_epoch = samples_per_epoch
         self.normalize_percentile = normalize_percentile
+        self.min_foreground_fraction = min_foreground_fraction
+        self.foreground_threshold = foreground_threshold
+        self.max_patch_tries = max_patch_tries
 
     @classmethod
     def from_dirs(
@@ -144,9 +191,15 @@ class AO2DPairDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         record = self.records[index % len(self.records)]
-        x = normalize01(load_image(record.aberrated), self.normalize_percentile)
-        y = normalize01(load_image(record.target), self.normalize_percentile)
-        x, y = _random_crop_pair(x, y, self.patch_size)
+        x, y = _normalize_pair01(load_image(record.aberrated), load_image(record.target), self.normalize_percentile)
+        x, y = _random_foreground_crop_pair(
+            x,
+            y,
+            self.patch_size,
+            self.min_foreground_fraction,
+            self.foreground_threshold,
+            self.max_patch_tries,
+        )
         if self.augment:
             x, y = _augment_pair(x, y)
         return {

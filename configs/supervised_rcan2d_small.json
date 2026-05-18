@@ -9,8 +9,8 @@
     "num_blocks": 5,
     "reduction": 8,
     "bn": false,
-    "residual_scale": 0.1,
-    "final_activation": "none"
+    "residual_scale": 1.0,
+    "final_activation": "sigmoid"
   },
   "data": {
     "patch_size": [
@@ -20,7 +20,10 @@
     "train": {
       "manifest": "metadata/manifest.csv",
       "augment": true,
-      "samples_per_epoch": 400
+      "samples_per_epoch": 400,
+      "min_foreground_fraction": 0.05,
+      "foreground_threshold": 0.2,
+      "max_patch_tries": 20
     },
     "val": {
       "manifest": "validation/metadata/manifest.csv",
@@ -32,12 +35,12 @@
     "epochs": 100,
     "batch_size": 8,
     "num_workers": 4,
-    "optimizer": "Adam",
+    "optimizer": "AdamW",
     "initial_learning_rate": 0.0001,
-    "lr_scheduler": "StepLR",
+    "lr_scheduler": "ReduceLROnPlateau",
+    "factor": 0.5,
+    "patience": 10,
     "min_lr": 1e-06,
-    "weight_decay": 0.0,
-    "step_size": 40,
-    "gamma": 0.5
+    "weight_decay": 0.0
   }
 }

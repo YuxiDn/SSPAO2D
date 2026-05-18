@@ -45,6 +45,13 @@ def make_dataset(config: dict, split: str, data_root: Path | None = None):
         augment=bool(data_cfg.get("augment", split == "train")),
         samples_per_epoch=data_cfg.get("samples_per_epoch"),
     )
+    if "normalize_percentile" in config["data"]:
+        common["normalize_percentile"] = tuple(config["data"]["normalize_percentile"])
+    if "normalize_percentile" in data_cfg:
+        common["normalize_percentile"] = tuple(data_cfg["normalize_percentile"])
+    for key in ("min_foreground_fraction", "foreground_threshold", "max_patch_tries"):
+        if key in data_cfg:
+            common[key] = data_cfg[key]
     if "manifest" in data_cfg:
         manifest = resolve_path(data_cfg["manifest"], data_root)
         return AO2DPairDataset.from_manifest(manifest, data_root=data_root, **common)
