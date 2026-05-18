@@ -22,6 +22,7 @@ from ao2d.training import (
     build_scheduler,
     cleanup_distributed,
     get_current_lr,
+    grad_norm,
     make_sampler,
     psnr,
     reduce_metrics,
@@ -56,6 +57,8 @@ def make_optics_config(config: dict) -> AO2DConfig:
 def run_epoch(model, forward_model, loader, optimizer, device, config, train: bool, show_progress: bool):
     model.train(train)
     totals = {"loss": 0.0, "cycle_psnr": 0.0, "cycle_ssim": 0.0}
+    if train:
+        totals["grad_norm"] = 0.0
     tv_weight = float(config["training"].get("tv_weight", 1e-5))
     coeff_l2 = float(config["training"].get("coeff_l2", 1e-4))
     with torch.set_grad_enabled(train):
@@ -70,6 +73,7 @@ def run_epoch(model, forward_model, loader, optimizer, device, config, train: bo
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                totals["grad_norm"] += grad_norm(model.parameters())
                 optimizer.step()
             totals["loss"] += float(loss.detach())
             totals["cycle_psnr"] += float(psnr(x, estimated).detach())
@@ -159,6 +163,7 @@ def main() -> None:
                     "train_loss": train_metrics.get("loss"),
                     "train_cycle_psnr": train_metrics.get("cycle_psnr"),
                     "train_cycle_ssim": train_metrics.get("cycle_ssim"),
+                    "train_grad_norm": train_metrics.get("grad_norm"),
                     "val_loss": val_metrics.get("loss"),
                     "val_cycle_psnr": val_metrics.get("cycle_psnr"),
                     "val_cycle_ssim": val_metrics.get("cycle_ssim"),

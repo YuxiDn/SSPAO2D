@@ -23,6 +23,7 @@ from ao2d.training import (
     build_scheduler,
     cleanup_distributed,
     get_current_lr,
+    grad_norm,
     make_sampler,
     psnr,
     reduce_metrics,
@@ -101,7 +102,7 @@ def train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer,
     coeff_net.train()
     weights = config["training"]
     use_sqrt = bool(weights.get("sqrt_intensity_loss", False))
-    totals = {"loss": 0.0, "loss_cycle": 0.0, "loss_object": 0.0, "loss_coeff": 0.0}
+    totals = {"loss": 0.0, "loss_cycle": 0.0, "loss_object": 0.0, "loss_coeff": 0.0, "grad_norm": 0.0}
 
     for batch in tqdm(obj_loader, desc="stage1", leave=False, disable=not show_progress):
         obj = batch["input"].to(device, non_blocking=True)
@@ -123,6 +124,7 @@ def train_stage1_epoch(obj_net, coeff_net, forward_model, obj_loader, optimizer,
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        totals["grad_norm"] += grad_norm(list(obj_net.parameters()) + list(coeff_net.parameters()))
         optimizer.step()
 
         totals["loss"] += float(loss.detach())
@@ -147,6 +149,7 @@ def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loade
         "loss_synth_cycle": 0.0,
         "loss_synth_object": 0.0,
         "loss_synth_coeff": 0.0,
+        "grad_norm": 0.0,
     }
 
     for real_batch in tqdm(real_loader, desc="stage2", leave=False, disable=not show_progress):
@@ -183,6 +186,7 @@ def train_stage2_epoch(obj_net, coeff_net, forward_model, real_loader, obj_loade
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        totals["grad_norm"] += grad_norm(list(obj_net.parameters()) + list(coeff_net.parameters()))
         optimizer.step()
 
         totals["loss"] += float(loss.detach())

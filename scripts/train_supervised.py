@@ -20,6 +20,7 @@ from ao2d.training import (
     build_scheduler,
     cleanup_distributed,
     get_current_lr,
+    grad_norm,
     make_sampler,
     psnr,
     reduce_metrics,
@@ -56,7 +57,9 @@ def make_dataset(config: dict, split: str, data_root: Path | None = None):
 
 def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool):
     model.train(train)
-    totals = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0}
+    totals = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_min": 0.0, "pred_max": 0.0, "pred_mean": 0.0}
+    if train:
+        totals["grad_norm"] = 0.0
     with torch.set_grad_enabled(train):
         for batch in tqdm(loader, desc="train" if train else "val", leave=False, disable=not show_progress):
             x = batch["input"].to(device, non_blocking=True)
@@ -67,10 +70,15 @@ def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                totals["grad_norm"] += grad_norm(model.parameters())
                 optimizer.step()
             totals["loss"] += float(loss.detach())
             totals["psnr"] += float(psnr(y, pred).detach())
             totals["ssim"] += float(ssim(y, pred).detach())
+            pred_detached = pred.detach()
+            totals["pred_min"] += float(pred_detached.amin())
+            totals["pred_max"] += float(pred_detached.amax())
+            totals["pred_mean"] += float(pred_detached.mean())
     return {k: v / max(1, len(loader)) for k, v in totals.items()}
 
 
@@ -142,9 +150,16 @@ def main() -> None:
                     "train_loss": train_metrics.get("loss"),
                     "train_psnr": train_metrics.get("psnr"),
                     "train_ssim": train_metrics.get("ssim"),
+                    "train_grad_norm": train_metrics.get("grad_norm"),
+                    "train_pred_min": train_metrics.get("pred_min"),
+                    "train_pred_max": train_metrics.get("pred_max"),
+                    "train_pred_mean": train_metrics.get("pred_mean"),
                     "val_loss": val_metrics.get("loss"),
                     "val_psnr": val_metrics.get("psnr"),
                     "val_ssim": val_metrics.get("ssim"),
+                    "val_pred_min": val_metrics.get("pred_min"),
+                    "val_pred_max": val_metrics.get("pred_max"),
+                    "val_pred_mean": val_metrics.get("pred_mean"),
                 })
                 write_metrics_xlsx(metrics_path, epoch_rows)
 

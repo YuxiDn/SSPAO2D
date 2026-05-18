@@ -46,7 +46,8 @@ class ResidualGroup2D(nn.Module):
         self.residual_scale = residual_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.blocks(x)) + self.residual_scale * x
+        residual = self.conv(self.blocks(x))
+        return x + self.residual_scale * residual
 
 
 class RCAN2D(nn.Module):

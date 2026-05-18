@@ -1,6 +1,7 @@
 """Training utilities."""
 
 from .forward_model import AO2DForwardModel
+from .gradients import grad_norm
 from .losses import relative_std_loss, total_variation_2d
 from .metrics import psnr, ssim
 from .optimizer import build_optimizer, get_learning_rate, set_optimizer_lr
@@ -22,6 +23,7 @@ __all__ = [
     "cleanup_distributed",
     "get_current_lr",
     "get_learning_rate",
+    "grad_norm",
     "make_sampler",
     "psnr",
     "reduce_metrics",

@@ -221,14 +221,40 @@ export AO2D_DATA_ROOT=/path/to/DATA_ROOT
 python scripts/train_supervised.py -c configs/supervised_2d.json -o outputs/care2d_supervised
 ```
 
-Multi-GPU training is supported with `torchrun`:
+Multi-GPU training is supported with `torchrun`. For example, to train RCAN2D
+small on two GPUs:
 
 ```bash
 torchrun --nproc_per_node=2 scripts/train_supervised.py \
-  -c configs/supervised_2d.json \
+  -c configs/supervised_rcan2d_small.json \
   --data-root /mnt/share/dyx/Data/Data2d \
-  -o outputs/care2d
+  -o outputs/rcan2d_supervised_small
 ```
+
+To run the same two-GPU job in the background, start it in a detached `screen`
+session:
+
+```bash
+screen -dmS rcan_train bash -lc '
+CUDA_VISIBLE_DEVICES=0,1 conda run -n ao2d torchrun --nproc_per_node=2 \
+  scripts/train_supervised.py \
+  -c configs/supervised_rcan2d_small.json \
+  --data-root /mnt/share/dyx/Data/Data2d \
+  -o outputs/rcan2d_supervised_small
+'
+```
+
+Useful monitoring commands:
+
+```bash
+screen -ls
+screen -r rcan_train
+nvidia-smi
+tail -f outputs/rcan2d_supervised_small/train.log
+```
+
+With `torchrun`, `training.batch_size` is the per-GPU batch size. For example,
+`batch_size=4` and `--nproc_per_node=2` gives an effective batch size of 8.
 
 The default supervised configuration uses `care2d` as a baseline. To use another baseline, replace the `model` section in the config with one of the `configs/model_*.json` examples.
 
