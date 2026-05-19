@@ -54,11 +54,15 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             **common,
             num_features=int(config.get("num_features", 32)),
             encoder_channels=int(config.get("encoder_channels", 64)),
-            num_groups=int(config.get("num_groups", 3)),
-            num_blocks=int(config.get("num_blocks", 3)),
+            num_groups=int(config.get("num_groups", config.get("num_rg", 3))),
+            num_blocks=int(config.get("num_blocks", config.get("num_rcab", 3))),
             reduction=int(config.get("reduction", 16)),
-            fft_branch=bool(config.get("fft_branch", True)),
-            unet_depth=int(config.get("unet_depth", 3)),
+            fft_branch=bool(config.get("fft_branch", config.get("fft_brunch", True))),
+            fft=bool(config.get("fft", True)),
+            fft_shift=bool(config.get("fft_shift", False)),
+            fft_forward=bool(config.get("fft_forward", True)),
+            unet_depth=int(config.get("unet_depth", config.get("num_down_up", 3))),
+            num_pixel_stack_layer=int(config.get("num_pixel_stack_layer", 0)),
         )
     if name in {"picnet", "picnet2d"}:
         return PICNet2D(
@@ -66,4 +70,3 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             zernike_modes=int(config.get("zernike_modes", len(config.get("zernike_indices", list(range(3, 16)))))),
         )
     raise ValueError(f"Unknown model name: {name}")
-

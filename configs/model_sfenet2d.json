@@ -4,11 +4,14 @@
   "out_channels": 1,
   "num_features": 32,
   "encoder_channels": 64,
-  "num_groups": 3,
-  "num_blocks": 3,
+  "num_groups": 2,
+  "num_blocks": 4,
   "reduction": 16,
   "fft_branch": true,
-  "unet_depth": 3,
+  "fft": true,
+  "fft_shift": false,
+  "fft_forward": true,
+  "unet_depth": 5,
+  "num_pixel_stack_layer": 0,
   "final_activation": "relu"
 }
-
