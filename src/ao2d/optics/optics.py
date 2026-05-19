@@ -171,7 +171,10 @@ def generate_psf2d_from_zernike(
     coefficients: torch.Tensor | None = None,
     config: AO2DConfig = AO2DConfig(),
 ) -> torch.Tensor:
-    """Generate a 2-D microscopy PSF from Zernike OPD coefficients in micrometers."""
+    """Generate a 2-D microscopy PSF from Zernike OPD coefficients in micrometers.
+
+    ``coefficients=None`` means no aberration, equivalent to all-zero Zernike coefficients.
+    """
 
     indices = tuple(int(v) for v in zernike_indices)
     if coefficients is None:
@@ -270,4 +273,3 @@ def convolve_fft2(image: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
     high = out.amax(dim=(-2, -1), keepdim=True)
     out = (out - low) / (high - low).clamp_min(torch.finfo(out.dtype).eps)
     return out
-

@@ -16,7 +16,7 @@ from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_
 from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import Discriminator2D
 from ao2d.optics import AO2DConfig
-from ao2d.training.epoch_metrics import write_metrics_xlsx
+from ao2d.training.epoch_metrics import read_metrics_xlsx, write_metrics_xlsx
 from ao2d.training import (
     AO2DForwardModel,
     build_optimizer,
@@ -57,6 +57,11 @@ def read_config(path: str | Path) -> dict:
         return json.load(f)
 
 
+def adversarial_weight(config: dict) -> float:
+    training = config["training"]
+    return float(training.get("adversarial_weight", training.get("adv_coefficient", 0.0)))
+
+
 def make_optics_config(config: dict) -> AO2DConfig:
     optics = config.get("optics", {})
     return AO2DConfig(
@@ -68,6 +73,83 @@ def make_optics_config(config: dict) -> AO2DConfig:
         pinhole_au=float(optics.get("pinhole_au", 1.0)),
         lightsheet_fwhm=float(optics.get("lightsheet_fwhm", 1.2)),
     )
+
+
+def make_self_dataset(config: dict, split: str, data_root: Path | None, augment_default: bool = False) -> AO2DSelfDataset:
+    data_cfg = config["data"]
+    split_cfg = data_cfg[split]
+    return AO2DSelfDataset(
+        resolve_path(split_cfg["image_dir"], data_root),
+        patch_size=tuple(data_cfg.get("patch_size", [256, 256])),
+        augment=bool(split_cfg.get("augment", augment_default)),
+        samples_per_epoch=split_cfg.get("samples_per_epoch"),
+    )
+
+
+def metric_values(rows: list[dict[str, object]], key: str) -> list[float]:
+    values = []
+    for row in rows:
+        raw = row.get(key)
+        if raw in {None, ""}:
+            continue
+        values.append(float(raw))
+    return values
+
+
+def checkpoint_state(
+    epoch: int,
+    model,
+    discriminator,
+    optimizer_G,
+    optimizer_D,
+    scheduler_G,
+    scheduler_D,
+    config: dict,
+    val_metrics: dict,
+) -> dict:
+    return {
+        "epoch": epoch,
+        "model": unwrap_ddp(model).state_dict(),
+        "discriminator": unwrap_ddp(discriminator).state_dict() if discriminator is not None else None,
+        "optimizer_G": optimizer_G.state_dict(),
+        "optimizer_D": optimizer_D.state_dict() if optimizer_D is not None else None,
+        "scheduler_G": scheduler_G.state_dict() if scheduler_G is not None else None,
+        "scheduler_D": scheduler_D.state_dict() if scheduler_D is not None else None,
+        "config": config,
+        "val": val_metrics,
+    }
+
+
+def resume_training(
+    resume: str,
+    output_dir: Path,
+    device,
+    model,
+    discriminator,
+    optimizer_G,
+    optimizer_D,
+    scheduler_G,
+    scheduler_D,
+) -> tuple[Path, int, float]:
+    resume_path = output_dir / "last.pt" if resume == "auto" else Path(resume)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+    checkpoint = torch.load(resume_path, map_location=device)
+    unwrap_ddp(model).load_state_dict(checkpoint["model"])
+    if discriminator is not None and checkpoint.get("discriminator") is not None:
+        unwrap_ddp(discriminator).load_state_dict(checkpoint["discriminator"])
+    optimizer_G.load_state_dict(checkpoint["optimizer_G"])
+    if optimizer_D is not None and checkpoint.get("optimizer_D") is not None:
+        optimizer_D.load_state_dict(checkpoint["optimizer_D"])
+    if scheduler_G is not None and checkpoint.get("scheduler_G") is not None:
+        scheduler_G.load_state_dict(checkpoint["scheduler_G"])
+    if scheduler_D is not None and checkpoint.get("scheduler_D") is not None:
+        scheduler_D.load_state_dict(checkpoint["scheduler_D"])
+
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    best = float(checkpoint.get("val", {}).get("loss", float("inf")))
+    return resume_path, start_epoch, best
 
 
 def next_object_batch(object_iter, object_loader, device):
@@ -105,7 +187,7 @@ def run_epoch(
         totals["loss_D"] = 0.0
     tv_weight = float(config["training"].get("tv_weight", 1e-5))
     coeff_l2 = float(config["training"].get("coeff_l2", 1e-4))
-    adv_weight = float(config["training"].get("adversarial_weight", config["training"].get("adv_coefficient", 0.0)))
+    adv_weight = adversarial_weight(config)
     object_iter = iter(object_loader) if object_loader is not None else None
     with torch.set_grad_enabled(train):
         for batch in tqdm(loader, desc="train" if train else "val", leave=False, disable=not show_progress):
@@ -150,6 +232,7 @@ def main() -> None:
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-o", "--output", default=None)
     parser.add_argument("--data-root", default=None, help="Dataset root. Overrides data.root/data.data_root and AO2D_DATA_ROOT.")
+    parser.add_argument("--resume", default=None, help="Checkpoint to resume from. Use 'auto' to load last.pt from the output directory.")
     args = parser.parse_args()
 
     ctx = setup_distributed()
@@ -168,7 +251,7 @@ def main() -> None:
     scheduler_G = build_scheduler(optimizer_G, config["training"], total_epochs=epochs, prefix="G")
     use_discriminator = (
         str(config.get("model", {}).get("name", "")).lower() in {"picnet", "picnet2d"}
-        and float(config["training"].get("adversarial_weight", config["training"].get("adv_coefficient", 0.0))) > 0
+        and adversarial_weight(config) > 0
         and "object_dir" in config["data"].get("train", {})
     )
     discriminator = Discriminator2D(in_channels=int(config["model"].get("out_channels", 1))).to(device) if use_discriminator else None
@@ -184,18 +267,8 @@ def main() -> None:
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
     forward_model = AO2DForwardModel(image_size, zernike_indices, make_optics_config(config)).to(device)
 
-    train_set = AO2DSelfDataset(
-        resolve_path(config["data"]["train"]["image_dir"], data_root),
-        patch_size=tuple(config["data"].get("patch_size", [256, 256])),
-        augment=bool(config["data"]["train"].get("augment", True)),
-        samples_per_epoch=config["data"]["train"].get("samples_per_epoch"),
-    )
-    val_set = AO2DSelfDataset(
-        resolve_path(config["data"]["val"]["image_dir"], data_root),
-        patch_size=tuple(config["data"].get("patch_size", [256, 256])),
-        augment=False,
-        samples_per_epoch=config["data"]["val"].get("samples_per_epoch"),
-    ) if "val" in config["data"] else None
+    train_set = make_self_dataset(config, "train", data_root, augment_default=True)
+    val_set = make_self_dataset(config, "val", data_root) if "val" in config["data"] else None
     train_sampler = make_sampler(train_set, ctx, shuffle=True)
     val_sampler = make_sampler(val_set, ctx, shuffle=False)
     object_set = (
@@ -242,11 +315,33 @@ def main() -> None:
         else None
     )
 
-    best = float("inf")
-    epoch_rows = []
     metrics_path = output_dir / "metrics.xlsx"
+    epoch_rows = read_metrics_xlsx(metrics_path) if args.resume else []
+    best = min(metric_values(epoch_rows, "val_loss"), default=float("inf"))
+    start_epoch = 1
+
+    if args.resume:
+        resume_path, start_epoch, checkpoint_best = resume_training(
+            args.resume,
+            output_dir,
+            device,
+            model,
+            discriminator,
+            optimizer_G,
+            optimizer_D,
+            scheduler_G,
+            scheduler_D,
+        )
+        best = min(best, checkpoint_best)
+        if ctx.is_main:
+            print(
+                f"resumed from {resume_path} at epoch={start_epoch - 1:04d} "
+                f"lr_G={get_current_lr(optimizer_G):.6g}"
+                + (f" lr_D={get_current_lr(optimizer_D):.6g}" if optimizer_D is not None else "")
+            )
+
     try:
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             set_sampler_epoch(train_sampler, epoch)
             set_sampler_epoch(val_sampler, epoch)
             set_sampler_epoch(object_sampler, epoch)
@@ -288,17 +383,17 @@ def main() -> None:
                     "val_cycle_ssim": val_metrics.get("cycle_ssim"),
                 })
                 write_metrics_xlsx(metrics_path, epoch_rows)
-                ckpt = {
-                    "epoch": epoch,
-                    "model": unwrap_ddp(model).state_dict(),
-                    "discriminator": unwrap_ddp(discriminator).state_dict() if discriminator is not None else None,
-                    "optimizer_G": optimizer_G.state_dict(),
-                    "optimizer_D": optimizer_D.state_dict() if optimizer_D is not None else None,
-                    "scheduler_G": scheduler_G.state_dict() if scheduler_G is not None else None,
-                    "scheduler_D": scheduler_D.state_dict() if scheduler_D is not None else None,
-                    "config": config,
-                    "val": val_metrics,
-                }
+                ckpt = checkpoint_state(
+                    epoch,
+                    model,
+                    discriminator,
+                    optimizer_G,
+                    optimizer_D,
+                    scheduler_G,
+                    scheduler_D,
+                    config,
+                    val_metrics,
+                )
                 torch.save(ckpt, output_dir / "last.pt")
                 if val_metrics["loss"] < best:
                     best = val_metrics["loss"]

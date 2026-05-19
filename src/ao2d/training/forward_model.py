@@ -17,7 +17,14 @@ class AO2DForwardModel(nn.Module):
         self.zernike_indices = tuple(int(v) for v in zernike_indices)
         self.config = config
 
-    def forward(self, object_or_restored: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+    def forward(self, object_or_restored: torch.Tensor, coefficients: torch.Tensor | None = None) -> torch.Tensor:
+        if coefficients is None:
+            batch_size = object_or_restored.shape[0] if object_or_restored.ndim >= 3 else 1
+            coefficients = torch.zeros(
+                (batch_size, len(self.zernike_indices)),
+                dtype=object_or_restored.dtype,
+                device=object_or_restored.device,
+            )
         psf = generate_psf2d_from_zernike(
             self.image_size,
             self.zernike_indices,

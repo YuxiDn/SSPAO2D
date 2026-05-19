@@ -29,6 +29,10 @@
     "val": {
       "image_dir": "validation/abe",
       "samples_per_epoch": 400
+    },
+    "test": {
+      "image_dir": "Test/abe",
+      "samples_per_epoch": 400
     }
   },
   "training": {
