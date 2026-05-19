@@ -12,7 +12,7 @@ def get_learning_rate(training_config: Mapping[str, object], prefix: str = "") -
     """Resolve a learning rate from either new or SSPAO-style config keys."""
 
     if prefix:
-        for key in (f"lr_{prefix}", f"initial_learning_rate_{prefix}"):
+        for key in (f"lr_{prefix}", f"initial_lr_{prefix}", f"initial_learning_rate_{prefix}"):
             if key in training_config:
                 return float(training_config[key])
     if "lr" in training_config:
