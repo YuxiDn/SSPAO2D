@@ -15,3 +15,6 @@ outputs/
 *.pth
 *.ckpt
 *.onnx
+
+# ignore third-party repositories downloaded into workspace
+otherscode/
