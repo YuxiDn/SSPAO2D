@@ -23,12 +23,12 @@
       "image_dir": "abe",
       "object_dir": "OBJ",
       "augment": true,
-      "samples_per_epoch": 800,
-      "object_samples_per_epoch": 800
+      "samples_per_epoch": 2000,
+      "object_samples_per_epoch": 2000
     },
     "val": {
       "image_dir": "validation/abe",
-      "samples_per_epoch": 160
+      "samples_per_epoch": 400
     }
   },
   "training": {
