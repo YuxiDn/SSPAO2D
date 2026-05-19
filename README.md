@@ -226,9 +226,9 @@ small on two GPUs:
 
 ```bash
 torchrun --nproc_per_node=2 scripts/train_supervised.py \
-  -c configs/supervised_rcan2d_small.json \
+  -c configs/supervised_rcan2d.json \
   --data-root /mnt/share/dyx/Data/Data2d \
-  -o outputs/rcan2d_supervised_small
+  -o outputs/rcan2d_supervised
 ```
 
 To run the same two-GPU job in the background, start it in a detached `screen`

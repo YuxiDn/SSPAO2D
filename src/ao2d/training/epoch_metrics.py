@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
+import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 
@@ -99,3 +100,36 @@ def write_metrics_xlsx(path: str | Path, rows: list[dict[str, object]]) -> None:
             "</styleSheet>",
         )
         zf.writestr("xl/worksheets/sheet1.xml", _worksheet(headers, rows))
+
+
+def read_metrics_xlsx(path: str | Path) -> list[dict[str, object]]:
+    path = Path(path)
+    if not path.exists():
+        return []
+
+    def value(cell: ET.Element) -> object:
+        if cell.attrib.get("t") == "inlineStr":
+            text = cell.findtext(".//{*}t")
+            return "" if text is None else text
+        raw = cell.findtext("{*}v")
+        if raw is None:
+            return None
+        try:
+            number = float(raw)
+        except ValueError:
+            return raw
+        return int(number) if number.is_integer() else number
+
+    with ZipFile(path, "r") as zf:
+        worksheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+
+    rows = worksheet.findall(".//{*}sheetData/{*}row")
+    if not rows:
+        return []
+    headers = [str(value(cell)) for cell in rows[0].findall("{*}c")]
+    metrics = []
+    for xml_row in rows[1:]:
+        cells = xml_row.findall("{*}c")
+        row = {header: value(cell) for header, cell in zip(headers, cells)}
+        metrics.append(row)
+    return metrics

@@ -1,16 +1,16 @@
 {
-  "output_dir": "outputs/rcan2d_supervised_v2",
+  "output_dir": "outputs/rcan2d_supervised_probe64_full",
   "model": {
     "name": "rcan2d",
     "in_channels": 1,
     "out_channels": 1,
-    "num_features": 32,
+    "num_features": 64,
     "num_groups": 5,
     "num_blocks": 5,
     "reduction": 8,
     "bn": false,
-    "residual_scale": 1.0,
-    "final_activation": "none"
+    "residual_scale": 0.1,
+    "final_activation": "sigmoid"
   },
   "data": {
     "patch_size": [
@@ -26,13 +26,17 @@
       "manifest": "validation/metadata/manifest.csv",
       "augment": false,
       "samples_per_epoch": 400
+    },
+    "test": {
+      "manifest": "Test/metadata/manifest.csv",
+      "augment": false
     }
   },
   "training": {
-    "epochs": 200,
-    "batch_size": 8,
+    "epochs": 300,
+    "batch_size": 4,
     "num_workers": 4,
-    "optimizer": "AdamW",
+    "optimizer": "Adam",
     "initial_learning_rate": 0.0001,
     "lr_scheduler": "ReduceLROnPlateau",
     "factor": 0.5,

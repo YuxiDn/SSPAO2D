@@ -23,6 +23,10 @@
       "manifest": "validation/metadata/manifest.csv",
       "augment": false,
       "samples_per_epoch": 400
+    },
+    "test": {
+      "manifest": "Test/metadata/manifest.csv",
+      "augment": false
     }
   },
   "training": {
