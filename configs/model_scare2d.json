@@ -8,6 +8,14 @@
   "zernike_modes": 13,
   "zernike_hidden": 128,
   "zernike_depth": 3,
+  "zernike_branch_channels": 64,
+  "zernike_num_features": 32,
+  "zernike_num_groups": 3,
+  "zernike_num_blocks": 3,
+  "zernike_reduction": 16,
+  "zernike_fft_branch": true,
+  "zernike_gradient_branch": true,
+  "zernike_fft": true,
+  "zernike_fft_shift": false,
   "final_activation": "sigmoid"
 }
-

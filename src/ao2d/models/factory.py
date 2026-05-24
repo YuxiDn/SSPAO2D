@@ -30,6 +30,15 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             zernike_modes=int(config.get("zernike_modes", len(config.get("zernike_indices", list(range(3, 16)))))),
             zernike_hidden=int(config.get("zernike_hidden", 128)),
             zernike_depth=int(config.get("zernike_depth", 3)),
+            zernike_branch_channels=int(config.get("zernike_branch_channels", 64)),
+            zernike_num_features=int(config.get("zernike_num_features", config.get("num_features", 32))),
+            zernike_num_groups=int(config.get("zernike_num_groups", config.get("num_groups", 3))),
+            zernike_num_blocks=int(config.get("zernike_num_blocks", config.get("num_blocks", 3))),
+            zernike_reduction=int(config.get("zernike_reduction", config.get("reduction", 16))),
+            zernike_fft_branch=bool(config.get("zernike_fft_branch", True)),
+            zernike_gradient_branch=bool(config.get("zernike_gradient_branch", True)),
+            zernike_fft=bool(config.get("zernike_fft", config.get("fft", True))),
+            zernike_fft_shift=bool(config.get("zernike_fft_shift", config.get("fft_shift", False))),
         )
     if name in {"rcan", "rcan2d"}:
         return RCAN2D(

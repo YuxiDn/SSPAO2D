@@ -1,12 +1,26 @@
 {
-  "output_dir": "/data/yxdeng993/output/PICNet/self_supervised_2d",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/scare2d_self_supervised_picnet_loss",
   "model": {
-    "name": "picnet2d",
+    "name": "scare2d",
     "in_channels": 1,
     "out_channels": 1,
     "final_activation": "sigmoid",
     "zernike_modes": 13,
-    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    "base_channels": 32,
+    "depth": 3,
+    "norm": "batch",
+    "zernike_hidden": 128,
+    "zernike_depth": 3,
+    "zernike_branch_channels": 64,
+    "zernike_num_features": 32,
+    "zernike_num_groups": 3,
+    "zernike_num_blocks": 3,
+    "zernike_reduction": 16,
+    "zernike_fft_branch": true,
+    "zernike_gradient_branch": true,
+    "zernike_fft": true,
+    "zernike_fft_shift": false
   },
   "optics": {
     "pixel_size": 0.300,
@@ -22,9 +36,11 @@
     "train": {
       "image_dir": "abe",
       "object_dir": "OBJ",
+      "identity_dir": "No_abe",
       "augment": true,
       "samples_per_epoch": 2000,
-      "object_samples_per_epoch": 2000
+      "object_samples_per_epoch": 2000,
+      "identity_samples_per_epoch": 2000
     },
     "val": {
       "image_dir": "validation/abe",
@@ -36,8 +52,10 @@
     }
   },
   "training": {
-    "epochs": 100,
-    "batch_size": 16,
+    "iterations": 300000,
+    "chk_iter": 500,
+    "model_chk_iter": 500,
+    "batch_size": 4,
     "num_workers": 4,
     "optimizer": "Adam",
     "initial_lr_G": 0.0002,
@@ -48,6 +66,16 @@
     "min_lr": 0.000004,
     "weight_decay": 0.0,
     "adversarial_weight": 0.001,
+    "cycle_aberrated_weight": 50.0,
+    "cycle_aberrated_l1_weight": 20.0,
+    "cycle_object_weight": 60.0,
+    "cycle_object_feature_weight": 100.0,
+    "cycle_aberration_weight": 40.0,
+    "identity_weight": 20.0,
+    "zernike_rms_min": 0.02,
+    "zernike_rms_max": 0.30,
+    "zernike_spectrum": "loworder",
+    "zernike_include_defocus": true,
     "tv_weight": 0.00001,
     "coeff_l2": 0.0001
   }
