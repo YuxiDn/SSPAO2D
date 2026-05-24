@@ -63,7 +63,16 @@ def make_dataset(config: dict, split: str, data_root: Path | None = None):
     )
 
 
-def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool):
+def supervised_loss(pred: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
+    name = loss_name.lower()
+    if name in {"l1", "mae"}:
+        return F.l1_loss(pred, target)
+    if name in {"mse", "l2"}:
+        return F.mse_loss(pred, target)
+    raise ValueError(f"Unsupported supervised loss: {loss_name}")
+
+
+def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool, loss_name: str = "l1"):
     model.train(train)
     totals = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_min": 0.0, "pred_max": 0.0, "pred_mean": 0.0}
     if train:
@@ -74,7 +83,7 @@ def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool
             y = batch["target"].to(device, non_blocking=True)
             out = model(x)
             pred = out[0] if isinstance(out, tuple) else out
-            loss = F.l1_loss(pred, y)
+            loss = supervised_loss(pred, y, loss_name)
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -208,8 +217,9 @@ def main() -> None:
             epoch = epoch_offset + local_epoch
             set_sampler_epoch(train_sampler, epoch)
             set_sampler_epoch(val_sampler, epoch)
-            train_metrics = run_epoch(model, train_loader, optimizer, device, train=True, show_progress=ctx.is_main)
-            val_metrics = run_epoch(model, val_loader, optimizer, device, train=False, show_progress=ctx.is_main) if val_loader else train_metrics
+            loss_name = str(config["training"].get("loss", config["training"].get("loss_function", "l1")))
+            train_metrics = run_epoch(model, train_loader, optimizer, device, train=True, show_progress=ctx.is_main, loss_name=loss_name)
+            val_metrics = run_epoch(model, val_loader, optimizer, device, train=False, show_progress=ctx.is_main, loss_name=loss_name) if val_loader else train_metrics
             train_metrics = reduce_metrics(train_metrics, ctx)
             val_metrics = reduce_metrics(val_metrics, ctx)
             step_scheduler(scheduler, val_metrics["loss"])
@@ -249,7 +259,8 @@ def main() -> None:
                     torch.save(ckpt, output_dir / "best.pt")
         if test_loader is not None:
             set_sampler_epoch(test_sampler, epoch_offset + epochs + 1)
-            test_metrics = run_epoch(model, test_loader, optimizer, device, train=False, show_progress=ctx.is_main)
+            loss_name = str(config["training"].get("loss", config["training"].get("loss_function", "l1")))
+            test_metrics = run_epoch(model, test_loader, optimizer, device, train=False, show_progress=ctx.is_main, loss_name=loss_name)
             test_metrics = reduce_metrics(test_metrics, ctx)
             if ctx.is_main:
                 print(f"test={test_metrics}")

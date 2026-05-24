@@ -111,9 +111,11 @@ class UpResidual2D(nn.Module):
         return self.residual(fused) + fused
 
 
-def fft_amplitude_2d(x: torch.Tensor, gamma: float = 0.8) -> torch.Tensor:
+def fft_amplitude_2d(x: torch.Tensor, gamma: float = 0.8, shift: bool = True) -> torch.Tensor:
     x32 = x.float()
     amp = torch.abs(torch.fft.fftn(x32, dim=(-2, -1))).clamp_min(1e-8).pow(gamma)
+    if shift:
+        amp = torch.fft.fftshift(amp, dim=(-2, -1))
     amp = torch.log10(1 + amp)
     mean = amp.mean(dim=(-2, -1), keepdim=True)
     std = amp.std(dim=(-2, -1), keepdim=True).clamp_min(1e-8)

@@ -18,3 +18,6 @@ outputs/
 
 # ignore third-party repositories downloaded into workspace
 otherscode/
+
+# ignore References
+References/
