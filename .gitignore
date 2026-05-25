@@ -20,3 +20,6 @@ otherscode/
 
 # ignore References
 References/
+
+#ignore infer_cond
+infer_cond_data2d.py
