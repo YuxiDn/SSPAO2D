@@ -107,6 +107,18 @@ def _random_crop_single(x: np.ndarray, patch_size: tuple[int, int] | None) -> np
     return x[top : top + ph, left : left + pw]
 
 
+def _center_crop_single(x: np.ndarray, patch_size: tuple[int, int] | None) -> np.ndarray:
+    if patch_size is None:
+        return x
+    ph, pw = patch_size
+    h, w = x.shape
+    if h < ph or w < pw:
+        raise ValueError(f"Patch size {patch_size} is larger than image shape {x.shape}")
+    top = (h - ph) // 2
+    left = (w - pw) // 2
+    return x[top : top + ph, left : left + pw]
+
+
 def _to_tensor(x: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(x))[None].float()
 
@@ -220,14 +232,19 @@ class AO2DSelfDataset(Dataset):
         augment: bool = True,
         samples_per_epoch: int | None = None,
         normalize_percentile: tuple[float, float] | None = (0.1, 99.9),
+        crop_mode: str = "random",
     ) -> None:
         self.files = _valid_files(image_dir)
         if not self.files:
             raise ValueError(f"No images found in {image_dir}")
+        crop_mode = crop_mode.lower()
+        if crop_mode not in {"random", "center"}:
+            raise ValueError(f"Unsupported crop_mode: {crop_mode}")
         self.patch_size = patch_size
         self.augment = augment
         self.samples_per_epoch = samples_per_epoch
         self.normalize_percentile = normalize_percentile
+        self.crop_mode = crop_mode
 
     def __len__(self) -> int:
         return self.samples_per_epoch or len(self.files)
@@ -235,7 +252,10 @@ class AO2DSelfDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         path = self.files[index % len(self.files)]
         x = normalize01(load_image(path), self.normalize_percentile)
-        x = _random_crop_single(x, self.patch_size)
+        if self.crop_mode == "center":
+            x = _center_crop_single(x, self.patch_size)
+        else:
+            x = _random_crop_single(x, self.patch_size)
         if self.augment:
             x = _augment_single(x)
         return {"input": _to_tensor(x), "input_path": str(path)}

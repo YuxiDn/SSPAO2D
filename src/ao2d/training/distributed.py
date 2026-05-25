@@ -53,8 +53,8 @@ def wrap_ddp(module: torch.nn.Module, ctx: DistributedContext) -> torch.nn.Modul
     if not ctx.distributed:
         return module
     if ctx.device.type == "cuda":
-        return DistributedDataParallel(module, device_ids=[ctx.local_rank], output_device=ctx.local_rank)
-    return DistributedDataParallel(module)
+        return DistributedDataParallel(module, device_ids=[ctx.local_rank], output_device=ctx.local_rank, broadcast_buffers=False)
+    return DistributedDataParallel(module, broadcast_buffers=False)
 
 
 def unwrap_ddp(module: torch.nn.Module) -> torch.nn.Module:
@@ -80,4 +80,3 @@ def reduce_metrics(metrics: dict[str, float], ctx: DistributedContext) -> dict[s
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     values = values / ctx.world_size
     return {k: float(v) for k, v in zip(keys, values.tolist(), strict=True)}
-

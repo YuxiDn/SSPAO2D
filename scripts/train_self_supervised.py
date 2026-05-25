@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -15,6 +17,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_path
+from ao2d.data.io import load_image, normalize01
 from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import Discriminator2D
 from ao2d.optics import AO2DConfig
@@ -41,11 +44,11 @@ from ao2d.training import (
 
 
 def adversarial_d_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
-    return F.softplus(fake_logits).mean() + F.softplus(-real_logits).mean()
+    return 0.5 * (F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean())
 
 
 def adversarial_g_loss(fake_logits: torch.Tensor) -> torch.Tensor:
-    return F.softplus(-fake_logits).mean()
+    return -0.5 * fake_logits.mean()
 
 
 def feature_l1_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -101,11 +104,13 @@ def make_optics_config(config: dict) -> AO2DConfig:
 def make_self_dataset(config: dict, split: str, data_root: Path | None, augment_default: bool = False) -> AO2DSelfDataset:
     data_cfg = config["data"]
     split_cfg = data_cfg[split]
+    augment = bool(split_cfg.get("augment", augment_default))
     return AO2DSelfDataset(
         resolve_path(split_cfg["image_dir"], data_root),
         patch_size=tuple(data_cfg.get("patch_size", [256, 256])),
-        augment=bool(split_cfg.get("augment", augment_default)),
+        augment=augment,
         samples_per_epoch=split_cfg.get("samples_per_epoch"),
+        crop_mode=str(split_cfg.get("crop_mode", "random" if augment else "center")),
     )
 
 
@@ -133,6 +138,237 @@ def append_metrics_row(path: Path, rows: list[dict[str, object]], row: dict[str,
     rows.append(row)
     append_csv_row(path.with_suffix(".csv"), list(row.keys()), row)
     write_metrics_xlsx(path.with_suffix(".xlsx"), rows)
+
+
+def spaced_indices(total: int, limit: int) -> list[int]:
+    if limit <= 0 or total <= 0:
+        return []
+    if limit >= total:
+        return list(range(total))
+    return np.linspace(0, total - 1, num=limit, dtype=int).tolist()
+
+
+def center_crop_array(x: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    h, w = x.shape[-2:]
+    th, tw = shape
+    if h == th and w == tw:
+        return x
+    top = max(0, (h - th) // 2)
+    left = max(0, (w - tw) // 2)
+    return x[top : top + th, left : left + tw]
+
+
+def rmse_np(pred: np.ndarray, target: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((pred - target) ** 2)))
+
+
+def pcc_np(pred: np.ndarray, target: np.ndarray) -> float:
+    pred_flat = pred.reshape(-1)
+    target_flat = target.reshape(-1)
+    pred_std = float(pred_flat.std())
+    target_std = float(target_flat.std())
+    if pred_std < 1e-12 or target_std < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(pred_flat, target_flat)[0, 1])
+
+
+def load_zernike_coefficients(path: Path) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    if path.suffix.lower() == ".npz":
+        with np.load(path) as data:
+            for key in ("coefficients_um", "coefficients", "zernike_coefficients"):
+                if key in data.files:
+                    return np.asarray(data[key], dtype=np.float32).reshape(-1)
+        return None
+    if path.suffix.lower() == ".mat":
+        try:
+            from scipy.io import loadmat
+        except ImportError:
+            return None
+        data = loadmat(path)
+        for key in ("coefficients", "coefficients_um", "zernike_coefficients"):
+            if key in data:
+                return np.asarray(data[key], dtype=np.float32).reshape(-1)
+    return None
+
+
+def infer_validation_paths(config: dict, data_root: Path | None) -> tuple[Path | None, Path | None]:
+    data_cfg = config["data"]
+    val_cfg = data_cfg.get("val", {})
+    if data_root is None:
+        return None, None
+    object_dir = val_cfg.get("object_dir")
+    zernike_dir = val_cfg.get("zernike_dir")
+    if object_dir is None:
+        object_dir = str(Path(val_cfg.get("image_dir", "validation/abe")).parent / "OBJ")
+    if zernike_dir is None:
+        zernike_dir = str(Path(val_cfg.get("image_dir", "validation/abe")).parent / "Zernike")
+    return resolve_path(object_dir, data_root), resolve_path(zernike_dir, data_root)
+
+
+def matched_object_path(input_path: Path, object_dir: Path | None) -> Path | None:
+    if object_dir is None:
+        return None
+    match = re.search(r"(obj_\d+)", input_path.stem)
+    if match is None:
+        return None
+    for suffix in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+        path = object_dir / f"{match.group(1)}{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def matched_zernike_path(input_path: Path, zernike_dir: Path | None) -> Path | None:
+    if zernike_dir is None:
+        return None
+    for suffix in (".mat", ".npz", ".npy"):
+        path = zernike_dir / f"{input_path.stem}_zernike{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def save_result_figure(
+    save_path: Path,
+    measured: np.ndarray,
+    target: np.ndarray | None,
+    restored: np.ndarray,
+    true_coeff: np.ndarray | None,
+    pred_coeff: np.ndarray,
+    metrics: dict[str, float],
+    display_limits: dict[str, tuple[float | None, float | None]],
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    def add_colorbar(fig, ax, im) -> None:
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="3%", pad=0.03)
+        fig.colorbar(im, cax=cax)
+
+    intensity_vmin, intensity_vmax = display_limits.get("intensity", (None, None))
+    object_vmin, object_vmax = display_limits.get("object", (None, None))
+    coeff_vmin, coeff_vmax = display_limits.get("zernike", (None, None))
+    fig = plt.figure(figsize=(12, 7), constrained_layout=True)
+    gs = GridSpec(2, 3, figure=fig, height_ratios=[1, 0.8])
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(measured, cmap="gray", vmin=intensity_vmin, vmax=intensity_vmax)
+    ax1.set_title("Aberrated")
+    ax1.axis("off")
+    add_colorbar(fig, ax1, im1)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    if target is not None:
+        im2 = ax2.imshow(target, cmap="hot", vmin=object_vmin, vmax=object_vmax)
+        ax2.set_title("Object (GT)")
+        add_colorbar(fig, ax2, im2)
+    else:
+        ax2.text(0.5, 0.5, "No GT object", ha="center", va="center")
+    ax2.axis("off")
+
+    ax3 = fig.add_subplot(gs[0, 2])
+    title = "Object (Pred)"
+    if metrics:
+        title += (
+            f"\nPSNR: {metrics.get('psnr', float('nan')):.2f}  "
+            f"SSIM: {metrics.get('ssim', float('nan')):.2f}\n"
+            f"RMSE: {metrics.get('rmse', float('nan')):.4f}  "
+            f"PCC: {metrics.get('pcc', float('nan')):.2f}"
+        )
+    im3 = ax3.imshow(restored, cmap="hot", vmin=object_vmin, vmax=object_vmax)
+    ax3.set_title(title)
+    ax3.axis("off")
+    add_colorbar(fig, ax3, im3)
+
+    ax4 = fig.add_subplot(gs[1, :])
+    x = np.arange(pred_coeff.size)
+    if true_coeff is not None and true_coeff.size == pred_coeff.size:
+        ax4.bar(x - 0.18, true_coeff, width=0.36, label="Ground truth")
+        ax4.bar(x + 0.18, pred_coeff, width=0.36, label="SCARE2D")
+    else:
+        ax4.bar(x, pred_coeff, width=0.5, label="SCARE2D")
+    ax4.set_xticks(x)
+    ax4.set_xticklabels([str(i) for i in range(3, 3 + pred_coeff.size)])
+    ax4.set_xlabel("Zernike polynomials")
+    ax4.set_ylabel("Coefficients")
+    if coeff_vmin is not None or coeff_vmax is not None:
+        ax4.set_ylim(coeff_vmin, coeff_vmax)
+    ax4.grid(axis="y", linestyle="--", alpha=0.4)
+    ax4.legend(loc="upper right", frameon=False)
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_validation_figures(
+    model,
+    dataset,
+    forward_model,
+    output_dir: Path,
+    config: dict,
+    data_root: Path | None,
+    device,
+) -> None:
+    if dataset is None:
+        return
+    val_cfg = config.get("data", {}).get("val", {})
+    limit = int(val_cfg.get("save_limit", config.get("training", {}).get("val_save_limit", 8)))
+    indices = spaced_indices(len(dataset), limit)
+    if not indices:
+        return
+    object_dir, zernike_dir = infer_validation_paths(config, data_root)
+    display_limits = {
+        "intensity": tuple(config.get("display", {}).get("intensity", [0.0, 1.0])),
+        "object": tuple(config.get("display", {}).get("object", [0.0, 1.0])),
+        "zernike": tuple(config.get("display", {}).get("zernike", [None, None])),
+    }
+    eval_model = unwrap_ddp(model)
+    was_training = eval_model.training
+    eval_model.eval()
+    with torch.no_grad():
+        for out_idx, dataset_idx in enumerate(indices, start=1):
+            sample = dataset[dataset_idx]
+            x = sample["input"][None].to(device)
+            restored, pred_coeff = eval_model(x)
+            measured = x[0, 0].detach().cpu().numpy()
+            restored_np = restored[0, 0].detach().cpu().numpy()
+            pred_coeff_np = pred_coeff[0].detach().cpu().numpy()
+
+            input_path = Path(str(sample.get("input_path", "")))
+            object_path = matched_object_path(input_path, object_dir)
+            target_np = None
+            metrics = {}
+            if object_path is not None:
+                target_np = normalize01(load_image(object_path), (0.1, 99.9))
+                target_np = center_crop_array(target_np, restored_np.shape)
+                metrics = {
+                    "psnr": float(psnr(torch.from_numpy(target_np)[None, None], torch.from_numpy(restored_np)[None, None])),
+                    "ssim": float(ssim(torch.from_numpy(target_np)[None, None], torch.from_numpy(restored_np)[None, None])),
+                    "rmse": rmse_np(restored_np, target_np),
+                    "pcc": pcc_np(restored_np, target_np),
+                }
+
+            coeff_path = matched_zernike_path(input_path, zernike_dir)
+            true_coeff = load_zernike_coefficients(coeff_path) if coeff_path is not None else None
+            save_result_figure(
+                output_dir / f"test{out_idx:04d}.png",
+                measured,
+                target_np,
+                restored_np,
+                true_coeff,
+                pred_coeff_np,
+                metrics,
+                display_limits,
+            )
+    eval_model.train(was_training)
 
 
 def checkpoint_state(
@@ -300,10 +536,37 @@ def train_iteration(
     weights = loss_weights(config)
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
     x = batch["input"].to(device, non_blocking=True)
-    output = model(x)
+
+    use_object_cycle = object_loader is not None and (
+        weights["cycle_object"] > 0 or weights["cycle_object_feature"] > 0 or weights["cycle_aberration"] > 0
+    )
+    use_identity = identity_loader is not None and weights["identity"] > 0
+    real_obj = None
+    target_coeff = None
+    clean_obj = None
+    model_inputs = [x]
+    split_sizes = [x.shape[0]]
+
+    if use_object_cycle:
+        real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
+        target_coeff = random_coefficients_batch(real_obj.shape[0], zernike_indices, device, config).to(dtype=real_obj.dtype)
+        generated_aberrated = forward_model(real_obj, target_coeff).float()
+        model_inputs.append(generated_aberrated)
+        split_sizes.append(generated_aberrated.shape[0])
+
+    if use_identity:
+        clean_obj, identity_iter = next_image_batch(identity_iter, identity_loader, device)
+        model_inputs.append(clean_obj)
+        split_sizes.append(clean_obj.shape[0])
+
+    output = model(torch.cat(model_inputs, dim=0))
     if not isinstance(output, tuple) or len(output) != 2:
         raise RuntimeError("Self-supervised AO training requires a model that returns (restored, zernike_coeff), such as scare2d or picnet2d.")
-    restored, coeff = output
+    restored_all, coeff_all = output
+    restored_parts = torch.split(restored_all, split_sizes, dim=0)
+    coeff_parts = torch.split(coeff_all, split_sizes, dim=0)
+    restored = restored_parts[0]
+    coeff = coeff_parts[0]
     estimated = forward_model(restored, coeff)
 
     loss_cycle_aberrated = weights["cycle_aberrated"] * feature_l1_loss(
@@ -318,13 +581,14 @@ def train_iteration(
     loss_cycle_aberration = x.new_zeros(())
     loss_identity = x.new_zeros(())
     loss_adv = x.new_zeros(())
+    loss_adv_weighted = x.new_zeros(())
     loss_D = x.new_zeros(())
 
-    if object_loader is not None and (weights["cycle_object"] > 0 or weights["cycle_object_feature"] > 0 or weights["cycle_aberration"] > 0):
-        real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
-        target_coeff = random_coefficients_batch(real_obj.shape[0], zernike_indices, device, config).to(dtype=real_obj.dtype)
-        generated_aberrated = forward_model(real_obj, target_coeff).float()
-        restored_obj, pred_coeff = model(generated_aberrated)
+    part_idx = 1
+    if use_object_cycle and real_obj is not None and target_coeff is not None:
+        restored_obj = restored_parts[part_idx]
+        pred_coeff = coeff_parts[part_idx]
+        part_idx += 1
         loss_cycle_object = (
             weights["cycle_object"] * F.l1_loss(restored_obj, real_obj)
             + weights["cycle_object_feature"] * feature_l1_loss(restored_obj, real_obj)
@@ -332,20 +596,19 @@ def train_iteration(
         loss_cycle_aberration = weights["cycle_aberration"] * F.l1_loss(pred_coeff, target_coeff)
         loss = loss + loss_cycle_object + loss_cycle_aberration
 
-    if identity_loader is not None and weights["identity"] > 0:
-        clean_obj, identity_iter = next_image_batch(identity_iter, identity_loader, device)
-        identity_restored, _ = model(clean_obj)
+    if use_identity and clean_obj is not None:
+        identity_restored = restored_parts[part_idx]
         zero_coeff = torch.zeros(clean_obj.shape[0], len(zernike_indices), device=device, dtype=clean_obj.dtype)
         identity_estimated = forward_model(identity_restored, zero_coeff).float()
         loss_identity = weights["identity"] * F.l1_loss(identity_estimated, clean_obj)
         loss = loss + loss_identity
 
     if discriminator is not None and optimizer_D is not None and weights["adversarial"] > 0:
-        real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
+        if real_obj is None:
+            real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
         set_requires_grad(discriminator, True)
         optimizer_D.zero_grad(set_to_none=True)
-        real_logits = discriminator(real_obj)
-        fake_logits = discriminator(restored.detach())
+        real_logits, fake_logits = torch.chunk(discriminator(torch.cat([real_obj, restored.detach()], dim=0)), 2, dim=0)
         loss_D = adversarial_d_loss(real_logits, fake_logits)
         loss_D.backward()
         optimizer_D.step()
@@ -353,7 +616,8 @@ def train_iteration(
         set_requires_grad(discriminator, False)
         fake_logits_G = discriminator(restored)
         loss_adv = adversarial_g_loss(fake_logits_G)
-        loss = loss + weights["adversarial"] * loss_adv
+        loss_adv_weighted = weights["adversarial"] * loss_adv
+        loss = loss + loss_adv_weighted
 
     optimizer_G.zero_grad(set_to_none=True)
     loss.backward()
@@ -363,7 +627,7 @@ def train_iteration(
 
     metrics = {
         "loss": float(loss.detach()),
-        "loss_adv": float(loss_adv.detach()),
+        "loss_adv": float(loss_adv_weighted.detach()),
         "loss_D": float(loss_D.detach()),
         "loss_cycle_aberrated": float(loss_cycle_aberrated.detach()),
         "loss_cycle_aberrated_l1": float(loss_cycle_aberrated_l1.detach()),
@@ -786,6 +1050,16 @@ def main() -> None:
                 iteration_dir = generated_dir / f"iterations_{iteration}"
                 iteration_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(ckpt, iteration_dir / "model.pth")
+                if iteration % model_chk_iter == 0:
+                    save_validation_figures(
+                        model,
+                        val_set,
+                        forward_model,
+                        iteration_dir,
+                        config,
+                        data_root,
+                        device,
+                    )
                 torch.save(ckpt, output_dir / "last.pt")
                 if val_metrics is not None:
                     val_row = {

@@ -44,12 +44,21 @@
     },
     "val": {
       "image_dir": "validation/abe",
+      "object_dir": "validation/OBJ",
+      "zernike_dir": "validation/Zernike",
+      "crop_mode": "center",
+      "save_limit": 16,
       "samples_per_epoch": 400
     },
     "test": {
       "image_dir": "Test/abe",
       "samples_per_epoch": 400
     }
+  },
+  "display": {
+    "intensity": [0.0, 1.0],
+    "object": [0.0, 1.0],
+    "zernike": [-0.35, 0.35]
   },
   "training": {
     "iterations": 300000,
