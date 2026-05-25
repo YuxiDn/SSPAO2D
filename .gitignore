@@ -11,10 +11,6 @@ src/*.egg-info/
 
 # training outputs/checkpoints
 outputs/
-*.pt
-*.pth
-*.ckpt
-*.onnx
 
 # ignore third-party repositories downloaded into workspace
 otherscode/
