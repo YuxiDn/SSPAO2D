@@ -4,7 +4,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from . import CARE2D, DFCAN2D, PICNet2D, RCAN2D, SCARE2D, SFENet2D
+from . import ABEFusionNet2D, CARE2D, DFCAN2D, PICNet2D, RCAN2D, SCARE2D, SFENet2D
 
 
 def make_model(config: dict[str, Any]) -> nn.Module:
@@ -77,5 +77,21 @@ def make_model(config: dict[str, Any]) -> nn.Module:
         return PICNet2D(
             **common,
             zernike_modes=int(config.get("zernike_modes", len(config.get("zernike_indices", list(range(3, 16)))))),
+        )
+    if name in {"abenet", "abenet2d", "abe_fusion", "abefusionnet2d"}:
+        return ABEFusionNet2D(
+            **common,
+            zernike_modes=int(config.get("zernike_modes", len(config.get("zernike_indices", list(range(3, 16)))))),
+            branch_channels=int(config.get("branch_channels", 32)),
+            fusion_channels=int(config.get("fusion_channels", 96)),
+            branch_depth=int(config.get("branch_depth", 2)),
+            obj_base_channels=int(config.get("obj_base_channels", config.get("base_channels", 64))),
+            obj_depth=int(config.get("obj_depth", config.get("unet_depth", config.get("depth", 3)))),
+            zernike_hidden=int(config.get("zernike_hidden", 128)),
+            zernike_depth=int(config.get("zernike_depth", 3)),
+            zernike_reduction=int(config.get("zernike_reduction", config.get("reduction", 8))),
+            fft=bool(config.get("fft", True)),
+            fft_shift=bool(config.get("fft_shift", False)),
+            num_pixel_stack_layer=int(config.get("num_pixel_stack_layer", 0)),
         )
     raise ValueError(f"Unknown model name: {name}")

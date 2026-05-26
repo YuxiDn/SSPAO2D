@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +77,12 @@ def set_requires_grad(module, requires_grad: bool) -> None:
         return
     for param in module.parameters():
         param.requires_grad_(requires_grad)
+
+
+def maybe_no_sync(module, sync_grad: bool):
+    if sync_grad or not hasattr(module, "no_sync"):
+        return nullcontext()
+    return module.no_sync()
 
 
 def read_config(path: str | Path) -> dict:
@@ -529,6 +536,10 @@ def train_iteration(
     object_iter=None,
     identity_loader=None,
     identity_iter=None,
+    zero_grad: bool = True,
+    step_optimizer: bool = True,
+    sync_grad: bool = True,
+    loss_scale: float = 1.0,
 ) -> tuple[dict[str, float], object, object]:
     model.train(True)
     if discriminator is not None:
@@ -607,11 +618,14 @@ def train_iteration(
         if real_obj is None:
             real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
         set_requires_grad(discriminator, True)
-        optimizer_D.zero_grad(set_to_none=True)
+        if zero_grad:
+            optimizer_D.zero_grad(set_to_none=True)
         real_logits, fake_logits = torch.chunk(discriminator(torch.cat([real_obj, restored.detach()], dim=0)), 2, dim=0)
         loss_D = adversarial_d_loss(real_logits, fake_logits)
-        loss_D.backward()
-        optimizer_D.step()
+        with maybe_no_sync(discriminator, sync_grad):
+            (loss_D / loss_scale).backward()
+        if step_optimizer:
+            optimizer_D.step()
 
         set_requires_grad(discriminator, False)
         fake_logits_G = discriminator(restored)
@@ -619,10 +633,13 @@ def train_iteration(
         loss_adv_weighted = weights["adversarial"] * loss_adv
         loss = loss + loss_adv_weighted
 
-    optimizer_G.zero_grad(set_to_none=True)
-    loss.backward()
-    grad = grad_norm(model.parameters())
-    optimizer_G.step()
+    if zero_grad:
+        optimizer_G.zero_grad(set_to_none=True)
+    with maybe_no_sync(model, sync_grad):
+        (loss / loss_scale).backward()
+    grad = grad_norm(model.parameters()) if step_optimizer else 0.0
+    if step_optimizer:
+        optimizer_G.step()
     set_requires_grad(discriminator, True)
 
     metrics = {
@@ -783,10 +800,18 @@ def main() -> None:
     parser.add_argument("-o", "--output", default=None)
     parser.add_argument("--data-root", default=None, help="Dataset root. Overrides data.root/data.data_root and AO2D_DATA_ROOT.")
     parser.add_argument("--resume", default=None, help="Checkpoint to resume from. Use 'auto' to load last.pt from the output directory.")
+    parser.add_argument(
+        "--accumulate-steps",
+        type=int,
+        default=None,
+        help="Number of micro-batches to accumulate before one optimizer step. Overrides training.accumulate_steps.",
+    )
     args = parser.parse_args()
 
     ctx = setup_distributed()
     config = read_config(args.config)
+    if args.accumulate_steps is not None:
+        config.setdefault("training", {})["accumulate_steps"] = args.accumulate_steps
     data_root = get_data_root(config, args.data_root)
     output_dir = Path(args.output or config.get("output_dir", "outputs/self_supervised"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -800,6 +825,7 @@ def main() -> None:
     iterations = int(config["training"].get("iterations", 300000))
     chk_iter = int(config["training"].get("chk_iter", config["training"].get("checkpoint_interval", 500)))
     model_chk_iter = int(config["training"].get("model_chk_iter", chk_iter))
+    accumulate_steps = max(1, int(config["training"].get("accumulate_steps", 1)))
     scheduler_G = build_scheduler(optimizer_G, config["training"], total_epochs=max(1, iterations // max(1, chk_iter)), prefix="G")
     train_data_cfg = config["data"].get("train", {})
     use_discriminator = adversarial_weight(config) > 0 and "object_dir" in train_data_cfg
@@ -953,28 +979,39 @@ def main() -> None:
             desc="Training",
             disable=not ctx.is_main,
         ):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                sampler_epoch += 1
-                set_sampler_epoch(train_sampler, sampler_epoch)
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
+            micro_metric_sums: dict[str, float] = {}
+            for micro_step in range(accumulate_steps):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    sampler_epoch += 1
+                    set_sampler_epoch(train_sampler, sampler_epoch)
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
 
-            metrics, object_iter, identity_iter = train_iteration(
-                model,
-                forward_model,
-                batch,
-                optimizer_G,
-                device,
-                config,
-                discriminator=discriminator,
-                optimizer_D=optimizer_D,
-                object_loader=object_loader,
-                object_iter=object_iter,
-                identity_loader=identity_loader,
-                identity_iter=identity_iter,
-            )
+                is_first_micro = micro_step == 0
+                is_last_micro = micro_step == accumulate_steps - 1
+                micro_metrics, object_iter, identity_iter = train_iteration(
+                    model,
+                    forward_model,
+                    batch,
+                    optimizer_G,
+                    device,
+                    config,
+                    discriminator=discriminator,
+                    optimizer_D=optimizer_D,
+                    object_loader=object_loader,
+                    object_iter=object_iter,
+                    identity_loader=identity_loader,
+                    identity_iter=identity_iter,
+                    zero_grad=is_first_micro,
+                    step_optimizer=is_last_micro,
+                    sync_grad=is_last_micro,
+                    loss_scale=float(accumulate_steps),
+                )
+                add_metric_sums(micro_metric_sums, micro_metrics)
+
+            metrics = average_metric_sums(micro_metric_sums, accumulate_steps)
             metrics = reduce_metrics(metrics, ctx)
             add_metric_sums(metric_sums, metrics)
 
