@@ -18,7 +18,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ao2d.data import AO2DSelfDataset, build_dataloader, get_data_root, resolve_path
-from ao2d.data.io import load_image, normalize01
+from ao2d.data.io import load_image
 from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import Discriminator2D
 from ao2d.optics import AO2DConfig
