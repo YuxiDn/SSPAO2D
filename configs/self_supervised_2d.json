@@ -82,6 +82,8 @@
     "zernike_rms_max": 0.30,
     "zernike_spectrum": "loworder",
     "zernike_include_defocus": true,
+    "phase_loss_weight": 10.0,
+    "phase_grad_loss_weight": 10.0,
     "tv_weight": 0.00001,
     "coeff_l2": 0.0001
   }

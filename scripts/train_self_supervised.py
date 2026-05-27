@@ -22,7 +22,7 @@ from ao2d.data.io import load_image, normalize01
 from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import Discriminator2D
 from ao2d.optics import AO2DConfig
-from ao2d.optics import random_zernike_coefficients
+from ao2d.optics import pupil_coordinates_2d, random_zernike_coefficients, zernike_wavefront
 from ao2d.training.epoch_metrics import read_metrics_xlsx, write_metrics_xlsx
 from ao2d.training import (
     AO2DForwardModel,
@@ -70,6 +70,52 @@ def feature_l1_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Ten
         dim=2,
     )
     return (torch.abs(gradx_pred - gradx_target) + torch.abs(grady_pred - grady_target)).mean()
+
+
+def zernike_phase(
+    coefficients: torch.Tensor,
+    zernike_indices: tuple[int, ...],
+    image_size: tuple[int, int],
+    optics_config: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    wavelength = float(optics_config.get("lambda_emission", optics_config.get("wavelength", 1.0)))
+    rho, theta, pupil_mask = pupil_coordinates_2d(
+        image_size,
+        float(optics_config.get("pixel_size", 0.300)),
+        wavelength,
+        float(optics_config.get("na", 1.05)),
+        device=coefficients.device,
+        dtype=coefficients.dtype,
+    )
+    wavefront = zernike_wavefront(zernike_indices, coefficients, rho, theta)
+    phase = 2.0 * torch.pi / wavelength * wavefront
+    return phase, pupil_mask
+
+
+def phase_consistency_losses(
+    pred_coeff: torch.Tensor,
+    target_coeff: torch.Tensor,
+    zernike_indices: tuple[int, ...],
+    image_size: tuple[int, int],
+    optics_config: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pred_phase, pupil_mask = zernike_phase(pred_coeff, zernike_indices, image_size, optics_config)
+    target_phase, _ = zernike_phase(target_coeff, zernike_indices, image_size, optics_config)
+    pupil_mask = pupil_mask.to(device=pred_phase.device)
+
+    phase_delta = pred_phase - target_phase
+    phase_loss = (1.0 - torch.cos(phase_delta))[:, pupil_mask].mean()
+
+    pred_dx = pred_phase[..., :, 1:] - pred_phase[..., :, :-1]
+    target_dx = target_phase[..., :, 1:] - target_phase[..., :, :-1]
+    pred_dy = pred_phase[..., 1:, :] - pred_phase[..., :-1, :]
+    target_dy = target_phase[..., 1:, :] - target_phase[..., :-1, :]
+    mask_dx = pupil_mask[:, 1:] & pupil_mask[:, :-1]
+    mask_dy = pupil_mask[1:, :] & pupil_mask[:-1, :]
+    phase_grad_loss = F.l1_loss(pred_dx[:, mask_dx], target_dx[:, mask_dx]) + F.l1_loss(
+        pred_dy[:, mask_dy], target_dy[:, mask_dy]
+    )
+    return phase_loss, phase_grad_loss
 
 
 def set_requires_grad(module, requires_grad: bool) -> None:
@@ -159,17 +205,17 @@ def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, object]) ->
     file_exists = path.exists()
     if file_exists:
         with path.open(newline="") as f:
-            rows = list(csv.reader(f))
-        if rows and rows[0] != fieldnames:
-            if len(rows[0]) != len(fieldnames):
-                raise ValueError(
-                    f"CSV schema mismatch for {path}: existing header has "
-                    f"{len(rows[0])} columns, new header has {len(fieldnames)} columns"
-                )
-            rows[0] = fieldnames
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            existing_fields = list(reader.fieldnames or [])
+        if existing_fields != fieldnames:
+            merged_fields = existing_fields + [name for name in fieldnames if name not in existing_fields]
             with path.open("w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerows(rows)
+                writer = csv.DictWriter(f, fieldnames=merged_fields)
+                writer.writeheader()
+                for existing_row in rows:
+                    writer.writerow({name: existing_row.get(name, "") for name in merged_fields})
+            fieldnames = merged_fields
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -562,6 +608,8 @@ def loss_weights(config: dict) -> dict[str, float]:
             "zernike_coeff_l1_weight",
             ("cycle_aberration_weight", "aberration_coefficient"),
         ),
+        "phase": float(training.get("phase_loss_weight", 0.0)),
+        "phase_grad": float(training.get("phase_grad_loss_weight", 0.0)),
         "identity": float(training.get("identity_weight", training.get("identity_coefficient", 0.0))),
         "adversarial": adversarial_weight(config),
     }
@@ -634,6 +682,8 @@ def train_iteration(
     loss = loss_cycle_aberrated_image_feature + loss_cycle_aberrated_image_l1 + loss_tv + loss_coeff_l2
     loss_cycle_object = x.new_zeros(())
     loss_zernike_coeff_l1 = x.new_zeros(())
+    loss_phase = x.new_zeros(())
+    loss_phase_grad = x.new_zeros(())
     loss_identity = x.new_zeros(())
     loss_adv = x.new_zeros(())
     loss_adv_weighted = x.new_zeros(())
@@ -649,7 +699,17 @@ def train_iteration(
             + weights["cycle_object_feature"] * feature_l1_loss(restored_obj, real_obj)
         )
         loss_zernike_coeff_l1 = weights["zernike_coeff_l1"] * F.l1_loss(pred_coeff, target_coeff)
-        loss = loss + loss_cycle_object + loss_zernike_coeff_l1
+        if weights["phase"] > 0 or weights["phase_grad"] > 0:
+            raw_phase_loss, raw_phase_grad_loss = phase_consistency_losses(
+                pred_coeff,
+                target_coeff,
+                zernike_indices,
+                tuple(config["data"].get("patch_size", [256, 256])),
+                config.get("optics", {}),
+            )
+            loss_phase = weights["phase"] * raw_phase_loss
+            loss_phase_grad = weights["phase_grad"] * raw_phase_grad_loss
+        loss = loss + loss_cycle_object + loss_zernike_coeff_l1 + loss_phase + loss_phase_grad
 
     if use_identity and clean_obj is not None:
         identity_restored = restored_parts[part_idx]
@@ -694,6 +754,8 @@ def train_iteration(
         "loss_cycle_aberrated_image_l1": float(loss_cycle_aberrated_image_l1.detach()),
         "loss_cycle_object": float(loss_cycle_object.detach()),
         "loss_zernike_coeff_l1": float(loss_zernike_coeff_l1.detach()),
+        "loss_phase": float(loss_phase.detach()),
+        "loss_phase_grad": float(loss_phase_grad.detach()),
         "loss_identity": float(loss_identity.detach()),
         "cycle_psnr": float(psnr(x, estimated).detach()),
         "cycle_ssim": float(ssim(x, estimated).detach()),
@@ -736,6 +798,8 @@ def run_epoch(
         totals["loss_cycle_aberrated_image_l1"] = 0.0
         totals["loss_cycle_object"] = 0.0
         totals["loss_zernike_coeff_l1"] = 0.0
+        totals["loss_phase"] = 0.0
+        totals["loss_phase_grad"] = 0.0
         totals["loss_identity"] = 0.0
     if train and discriminator is not None:
         totals["loss_adv"] = 0.0
@@ -772,6 +836,8 @@ def run_epoch(
         "zernike_coeff_l1_weight",
         ("cycle_aberration_weight", "aberration_coefficient"),
     )
+    phase_loss_weight = float(training.get("phase_loss_weight", 0.0))
+    phase_grad_loss_weight = float(training.get("phase_grad_loss_weight", 0.0))
     identity_weight = float(config["training"].get("identity_weight", config["training"].get("identity_coefficient", 0.0)))
     adv_weight = adversarial_weight(config)
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
@@ -795,10 +861,18 @@ def run_epoch(
             loss = loss_cycle_aberrated_image_feature + loss_cycle_aberrated_image_l1 + loss_tv + loss_coeff_l2
             loss_cycle_object = x.new_zeros(())
             loss_zernike_coeff_l1 = x.new_zeros(())
+            loss_phase = x.new_zeros(())
+            loss_phase_grad = x.new_zeros(())
             loss_identity = x.new_zeros(())
 
             if train:
-                if object_loader is not None and (cycle_object_weight > 0 or cycle_object_feature_weight > 0 or zernike_coeff_l1_weight > 0):
+                if object_loader is not None and (
+                    cycle_object_weight > 0
+                    or cycle_object_feature_weight > 0
+                    or zernike_coeff_l1_weight > 0
+                    or phase_loss_weight > 0
+                    or phase_grad_loss_weight > 0
+                ):
                     real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
                     target_coeff = random_coefficients_batch(real_obj.shape[0], zernike_indices, device, config).to(dtype=real_obj.dtype)
                     generated_aberrated = forward_model(real_obj, target_coeff).float()
@@ -808,7 +882,17 @@ def run_epoch(
                         + cycle_object_feature_weight * feature_l1_loss(restored_obj, real_obj)
                     )
                     loss_zernike_coeff_l1 = zernike_coeff_l1_weight * F.l1_loss(pred_coeff, target_coeff)
-                    loss = loss + loss_cycle_object + loss_zernike_coeff_l1
+                    if phase_loss_weight > 0 or phase_grad_loss_weight > 0:
+                        raw_phase_loss, raw_phase_grad_loss = phase_consistency_losses(
+                            pred_coeff,
+                            target_coeff,
+                            zernike_indices,
+                            tuple(config["data"].get("patch_size", [256, 256])),
+                            config.get("optics", {}),
+                        )
+                        loss_phase = phase_loss_weight * raw_phase_loss
+                        loss_phase_grad = phase_grad_loss_weight * raw_phase_grad_loss
+                    loss = loss + loss_cycle_object + loss_zernike_coeff_l1 + loss_phase + loss_phase_grad
 
                 if identity_loader is not None and identity_weight > 0:
                     clean_obj, identity_iter = next_image_batch(identity_iter, identity_loader, device)
@@ -849,6 +933,8 @@ def run_epoch(
                 totals["loss_cycle_aberrated_image_l1"] += float(loss_cycle_aberrated_image_l1.detach())
                 totals["loss_cycle_object"] += float(loss_cycle_object.detach())
                 totals["loss_zernike_coeff_l1"] += float(loss_zernike_coeff_l1.detach())
+                totals["loss_phase"] += float(loss_phase.detach())
+                totals["loss_phase_grad"] += float(loss_phase_grad.detach())
                 totals["loss_identity"] += float(loss_identity.detach())
             totals["loss"] += float(loss.detach())
             totals["cycle_psnr"] += float(psnr(x, estimated).detach())
@@ -959,6 +1045,8 @@ def main() -> None:
         training_float(training, "cycle_object_weight", ("pha_coefficient",)) > 0
         or training_float(training, "cycle_object_feature_weight", ("feature_pha_coefficient",)) > 0
         or training_float(training, "zernike_coeff_l1_weight", ("cycle_aberration_weight", "aberration_coefficient")) > 0
+        or training_float(training, "phase_loss_weight") > 0
+        or training_float(training, "phase_grad_loss_weight") > 0
     )
     object_set = (
         AO2DSelfDataset(
@@ -1045,6 +1133,8 @@ def main() -> None:
         "G_cycle_aberrated_image_l1_loss": [],
         "G_cycle_object_loss": [],
         "G_zernike_coeff_l1_loss": [],
+        "G_phase_loss": [],
+        "G_phase_grad_loss": [],
         "G_identity_clean_loss": [],
     }
 
@@ -1142,6 +1232,8 @@ def main() -> None:
             )
             loss_history["G_cycle_object_loss"].append(round(train_metrics.get("loss_cycle_object", 0.0), 6))
             loss_history["G_zernike_coeff_l1_loss"].append(round(train_metrics.get("loss_zernike_coeff_l1", 0.0), 6))
+            loss_history["G_phase_loss"].append(round(train_metrics.get("loss_phase", 0.0), 6))
+            loss_history["G_phase_grad_loss"].append(round(train_metrics.get("loss_phase_grad", 0.0), 6))
             loss_history["G_identity_clean_loss"].append(round(train_metrics.get("loss_identity", 0.0), 6))
 
             val_metrics = None
@@ -1172,6 +1264,8 @@ def main() -> None:
                     "cycle_aberrated_image_l1_loss": train_metrics.get("loss_cycle_aberrated_image_l1"),
                     "cycle_object_loss": train_metrics.get("loss_cycle_object"),
                     "zernike_coeff_l1_loss": train_metrics.get("loss_zernike_coeff_l1"),
+                    "phase_loss": train_metrics.get("loss_phase"),
+                    "phase_grad_loss": train_metrics.get("loss_phase_grad"),
                     "identity_clean_loss": train_metrics.get("loss_identity"),
                     "total_loss": train_metrics.get("loss"),
                     "cycle_psnr": train_metrics.get("cycle_psnr"),
