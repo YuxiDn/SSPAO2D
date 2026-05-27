@@ -8,10 +8,13 @@
     "num_groups": 4,
     "num_blocks": 4,
     "reduction": 16,
-    "final_activation": "sigmoid"
+    "final_activation": null
   },
   "data": {
     "root": "/mnt/share/dyx/Data/Data2d",
+    "normalization_mode": "input_scale",
+    "input_scale_method": "percentile",
+    "input_scale_percentile": 99.9,
     "patch_size": [512, 512],
     "train": {
       "manifest": "metadata/manifest.csv",

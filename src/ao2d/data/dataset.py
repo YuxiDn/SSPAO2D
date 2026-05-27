@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -10,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from .io import IMAGE_EXTENSIONS, load_image, normalize01
+from .io import IMAGE_EXTENSIONS, load_image
 from .paths import infer_manifest_data_root, resolve_manifest_record_path
 
 
@@ -59,6 +60,8 @@ def _normalize_pair01(
     y: np.ndarray,
     percentile: tuple[float, float] | None = (0.1, 99.9),
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Legacy pairwise min-max normalization. Do not use for AO restoration training."""
+
     x = x.astype(np.float32, copy=False)
     y = y.astype(np.float32, copy=False)
     values = np.concatenate([x.reshape(-1), y.reshape(-1)])
@@ -70,6 +73,43 @@ def _normalize_pair01(
     x = np.clip(x, lo, hi)
     y = np.clip(y, lo, hi)
     return ((x - lo) / denom).astype(np.float32), ((y - lo) / denom).astype(np.float32)
+
+
+def _estimate_scale_from_input(
+    x: np.ndarray,
+    method: str = "percentile",
+    percentile: float = 99.9,
+    eps: float | None = None,
+) -> float:
+    x = x.astype(np.float32, copy=False)
+    values = x[np.isfinite(x)]
+    if values.size == 0:
+        return 1.0
+    values = np.maximum(values, 0)
+    method = method.lower()
+    if method == "max":
+        scale = float(np.max(values))
+    elif method == "percentile":
+        scale = float(np.percentile(values, percentile))
+    else:
+        raise ValueError(f"Unsupported input scale method: {method}")
+    if eps is None:
+        eps = float(np.finfo(np.float32).eps)
+    return max(scale, eps)
+
+
+def _normalize_pair_by_input_scale(
+    x: np.ndarray,
+    y: np.ndarray,
+    method: str = "percentile",
+    percentile: float = 99.9,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    x = x.astype(np.float32, copy=False)
+    y = y.astype(np.float32, copy=False)
+    scale = _estimate_scale_from_input(x, method=method, percentile=percentile)
+    x = np.maximum(x, 0) / scale
+    y = np.maximum(y, 0) / scale
+    return x.astype(np.float32), y.astype(np.float32), scale
 
 
 def _foreground_fraction(x: np.ndarray, threshold: float) -> float:
@@ -128,6 +168,8 @@ class PairRecord:
     aberrated: Path
     target: Path
     coeff: Path | None = None
+    training_normalization_scale: float | None = None
+    output_intensity_units: str | None = None
 
 
 class AO2DPairDataset(Dataset):
@@ -139,7 +181,10 @@ class AO2DPairDataset(Dataset):
         patch_size: tuple[int, int] | None = None,
         augment: bool = True,
         samples_per_epoch: int | None = None,
-        normalize_percentile: tuple[float, float] | None = (0.1, 99.9),
+        normalization_mode: str = "input_scale",
+        input_scale_method: str = "percentile",
+        input_scale_percentile: float = 99.9,
+        normalize_percentile: tuple[float, float] | None = None,
         min_foreground_fraction: float | None = None,
         foreground_threshold: float = 0.03,
         max_patch_tries: int = 20,
@@ -150,6 +195,16 @@ class AO2DPairDataset(Dataset):
         self.patch_size = patch_size
         self.augment = augment
         self.samples_per_epoch = samples_per_epoch
+        if normalize_percentile is not None and normalization_mode == "input_scale":
+            warnings.warn(
+                "normalize_percentile is deprecated for AO restoration training; "
+                "using input_scale normalization and input_scale_percentile instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.normalization_mode = normalization_mode.lower()
+        self.input_scale_method = input_scale_method.lower()
+        self.input_scale_percentile = float(input_scale_percentile)
         self.normalize_percentile = normalize_percentile
         self.min_foreground_fraction = min_foreground_fraction
         self.foreground_threshold = foreground_threshold
@@ -187,6 +242,9 @@ class AO2DPairDataset(Dataset):
                 src = row.get("abe_path") or row.get("aberrated") or row.get("input")
                 tgt = row.get("no_abe_path") or row.get("target") or row.get("gt")
                 coeff = row.get("zernike_path") or row.get("coeff_path") or None
+                scale_text = row.get("training_normalization_scale") or row.get("input_normalization_scale")
+                scale = float(scale_text) if scale_text else None
+                units = row.get("output_intensity_units") or None
                 if not src or not tgt:
                     continue
                 records.append(
@@ -194,6 +252,8 @@ class AO2DPairDataset(Dataset):
                         resolve_manifest_record_path(src, root),
                         resolve_manifest_record_path(tgt, root),
                         resolve_manifest_record_path(coeff, root) if coeff else None,
+                        scale,
+                        units,
                     )
                 )
         return cls(records, **kwargs)
@@ -203,7 +263,30 @@ class AO2DPairDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         record = self.records[index % len(self.records)]
-        x, y = _normalize_pair01(load_image(record.aberrated), load_image(record.target), self.normalize_percentile)
+        x_raw = load_image(record.aberrated)
+        y_raw = load_image(record.target)
+        if self.normalization_mode == "input_scale":
+            x, y, scale = _normalize_pair_by_input_scale(
+                x_raw,
+                y_raw,
+                method=self.input_scale_method,
+                percentile=self.input_scale_percentile,
+            )
+        elif self.normalization_mode == "manifest_scale":
+            scale = record.training_normalization_scale
+            if scale is None:
+                raise ValueError(f"Missing training_normalization_scale for {record.aberrated}")
+            x = np.maximum(x_raw.astype(np.float32, copy=False), 0) / scale
+            y = np.maximum(y_raw.astype(np.float32, copy=False), 0) / scale
+        elif self.normalization_mode == "none":
+            scale = 1.0
+            x = x_raw.astype(np.float32, copy=False)
+            y = y_raw.astype(np.float32, copy=False)
+        elif self.normalization_mode == "pair_minmax":
+            x, y = _normalize_pair01(x_raw, y_raw, self.normalize_percentile)
+            scale = 1.0
+        else:
+            raise ValueError(f"Unsupported normalization_mode: {self.normalization_mode}")
         x, y = _random_foreground_crop_pair(
             x,
             y,
@@ -217,6 +300,7 @@ class AO2DPairDataset(Dataset):
         return {
             "input": _to_tensor(x),
             "target": _to_tensor(y),
+            "input_scale": torch.tensor(scale, dtype=torch.float32),
             "input_path": str(record.aberrated),
             "target_path": str(record.target),
         }
@@ -231,7 +315,10 @@ class AO2DSelfDataset(Dataset):
         patch_size: tuple[int, int] | None = None,
         augment: bool = True,
         samples_per_epoch: int | None = None,
-        normalize_percentile: tuple[float, float] | None = (0.1, 99.9),
+        normalization_mode: str = "input_scale",
+        input_scale_method: str = "percentile",
+        input_scale_percentile: float = 99.9,
+        normalize_percentile: tuple[float, float] | None = None,
         crop_mode: str = "random",
     ) -> None:
         self.files = _valid_files(image_dir)
@@ -243,6 +330,16 @@ class AO2DSelfDataset(Dataset):
         self.patch_size = patch_size
         self.augment = augment
         self.samples_per_epoch = samples_per_epoch
+        if normalize_percentile is not None and normalization_mode == "input_scale":
+            warnings.warn(
+                "normalize_percentile is deprecated for AO training inputs; "
+                "using input_scale normalization and input_scale_percentile instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.normalization_mode = normalization_mode.lower()
+        self.input_scale_method = input_scale_method.lower()
+        self.input_scale_percentile = float(input_scale_percentile)
         self.normalize_percentile = normalize_percentile
         self.crop_mode = crop_mode
 
@@ -251,14 +348,26 @@ class AO2DSelfDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         path = self.files[index % len(self.files)]
-        x = normalize01(load_image(path), self.normalize_percentile)
+        x_raw = load_image(path)
+        if self.normalization_mode == "input_scale":
+            scale = _estimate_scale_from_input(
+                x_raw,
+                method=self.input_scale_method,
+                percentile=self.input_scale_percentile,
+            )
+            x = np.maximum(x_raw.astype(np.float32, copy=False), 0) / scale
+        elif self.normalization_mode == "none":
+            scale = 1.0
+            x = x_raw.astype(np.float32, copy=False)
+        else:
+            raise ValueError(f"Unsupported normalization_mode for AO2DSelfDataset: {self.normalization_mode}")
         if self.crop_mode == "center":
             x = _center_crop_single(x, self.patch_size)
         else:
             x = _random_crop_single(x, self.patch_size)
         if self.augment:
             x = _augment_single(x)
-        return {"input": _to_tensor(x), "input_path": str(path)}
+        return {"input": _to_tensor(x), "input_scale": torch.tensor(scale, dtype=torch.float32), "input_path": str(path)}
 
 
 def build_dataloader(

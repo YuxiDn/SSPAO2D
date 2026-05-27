@@ -268,8 +268,4 @@ def convolve_fft2(image: torch.Tensor, psf: torch.Tensor) -> torch.Tensor:
 
     otf = torch.fft.fft2(torch.fft.ifftshift(psf, dim=(-2, -1)), s=image.shape[-2:])
     out = torch.real(torch.fft.ifft2(torch.fft.fft2(image) * otf))
-    out = torch.clamp(out, min=0)
-    low = out.amin(dim=(-2, -1), keepdim=True)
-    high = out.amax(dim=(-2, -1), keepdim=True)
-    out = (out - low) / (high - low).clamp_min(torch.finfo(out.dtype).eps)
-    return out
+    return torch.clamp(out, min=0)

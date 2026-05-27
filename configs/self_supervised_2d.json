@@ -4,7 +4,7 @@
     "name": "scare2d",
     "in_channels": 1,
     "out_channels": 1,
-    "final_activation": "sigmoid",
+    "final_activation": null,
     "zernike_modes": 13,
     "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     "base_channels": 32,
@@ -32,6 +32,9 @@
   },
   "data": {
     "root": "/data/yxdeng993/data/2Dsim",
+    "normalization_mode": "input_scale",
+    "input_scale_method": "percentile",
+    "input_scale_percentile": 99.9,
     "patch_size": [512, 512],
     "train": {
       "image_dir": "abe",

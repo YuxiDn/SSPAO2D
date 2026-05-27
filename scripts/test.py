@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ao2d.data.io import IMAGE_EXTENSIONS, load_image, normalize01, save_image
+from ao2d.data.dataset import _estimate_scale_from_input
+from ao2d.data.io import IMAGE_EXTENSIONS, load_image, save_image
 from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 
@@ -58,7 +59,9 @@ def main() -> None:
 
     with torch.no_grad():
         for path in tqdm(files, desc="test"):
-            img = normalize01(load_image(path), (0.1, 99.9))
+            raw = load_image(path).astype(np.float32, copy=False)
+            scale = _estimate_scale_from_input(raw, method="percentile", percentile=99.9)
+            img = np.maximum(raw, 0) / scale
             x = torch.from_numpy(np.ascontiguousarray(img))[None, None].float().to(device)
             if model is None:
                 out = (object_generator(x), aberration_generator(x))

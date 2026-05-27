@@ -13,5 +13,5 @@
   "fft_forward": true,
   "unet_depth": 5,
   "num_pixel_stack_layer": 0,
-  "final_activation": "relu"
+  "final_activation": null
 }

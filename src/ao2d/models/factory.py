@@ -12,7 +12,7 @@ def make_model(config: dict[str, Any]) -> nn.Module:
     common = dict(
         in_channels=int(config.get("in_channels", 1)),
         out_channels=int(config.get("out_channels", 1)),
-        final_activation=str(config.get("final_activation", "sigmoid")),
+        final_activation=config.get("final_activation", "sigmoid"),
     )
     if name in {"care", "care2d", "unet", "unet2d"}:
         return CARE2D(

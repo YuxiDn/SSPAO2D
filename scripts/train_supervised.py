@@ -45,6 +45,11 @@ def make_dataset(config: dict, split: str, data_root: Path | None = None):
         patch_size=tuple(config["data"].get("patch_size", [256, 256])),
         augment=bool(data_cfg.get("augment", split == "train")),
         samples_per_epoch=data_cfg.get("samples_per_epoch"),
+        normalization_mode=str(data_cfg.get("normalization_mode", config["data"].get("normalization_mode", "input_scale"))),
+        input_scale_method=str(data_cfg.get("input_scale_method", config["data"].get("input_scale_method", "percentile"))),
+        input_scale_percentile=float(
+            data_cfg.get("input_scale_percentile", config["data"].get("input_scale_percentile", 99.9))
+        ),
     )
     if "normalize_percentile" in config["data"]:
         common["normalize_percentile"] = tuple(config["data"]["normalize_percentile"])

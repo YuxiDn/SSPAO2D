@@ -17,5 +17,5 @@
   "zernike_gradient_branch": true,
   "zernike_fft": true,
   "zernike_fft_shift": false,
-  "final_activation": "sigmoid"
+  "final_activation": null
 }

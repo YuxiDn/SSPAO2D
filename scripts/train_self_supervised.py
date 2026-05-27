@@ -117,6 +117,9 @@ def make_self_dataset(config: dict, split: str, data_root: Path | None, augment_
         patch_size=tuple(data_cfg.get("patch_size", [256, 256])),
         augment=augment,
         samples_per_epoch=split_cfg.get("samples_per_epoch"),
+        normalization_mode=str(split_cfg.get("normalization_mode", data_cfg.get("normalization_mode", "input_scale"))),
+        input_scale_method=str(split_cfg.get("input_scale_method", data_cfg.get("input_scale_method", "percentile"))),
+        input_scale_percentile=float(split_cfg.get("input_scale_percentile", data_cfg.get("input_scale_percentile", 99.9))),
         crop_mode=str(split_cfg.get("crop_mode", "random" if augment else "center")),
     )
 
@@ -354,7 +357,10 @@ def save_validation_figures(
             target_np = None
             metrics = {}
             if object_path is not None:
-                target_np = normalize01(load_image(object_path), (0.1, 99.9))
+                scale = float(sample.get("input_scale", torch.tensor(1.0)))
+                target_np = np.maximum(load_image(object_path).astype(np.float32, copy=False), 0) / max(
+                    scale, float(np.finfo(np.float32).eps)
+                )
                 target_np = center_crop_array(target_np, restored_np.shape)
                 metrics = {
                     "psnr": float(psnr(torch.from_numpy(target_np)[None, None], torch.from_numpy(restored_np)[None, None])),
@@ -854,12 +860,20 @@ def main() -> None:
             ("cycle_aberration_weight", "aberration_coefficient"),
         )
     )
+    self_norm_kwargs = dict(
+        normalization_mode=str(train_data_cfg.get("normalization_mode", config["data"].get("normalization_mode", "input_scale"))),
+        input_scale_method=str(train_data_cfg.get("input_scale_method", config["data"].get("input_scale_method", "percentile"))),
+        input_scale_percentile=float(
+            train_data_cfg.get("input_scale_percentile", config["data"].get("input_scale_percentile", 99.9))
+        ),
+    )
     object_set = (
         AO2DSelfDataset(
             resolve_path(train_data_cfg["object_dir"], data_root),
             patch_size=tuple(config["data"].get("patch_size", [256, 256])),
             augment=bool(train_data_cfg.get("object_augment", train_data_cfg.get("augment", True))),
             samples_per_epoch=train_data_cfg.get("object_samples_per_epoch", train_data_cfg.get("samples_per_epoch")),
+            **self_norm_kwargs,
         )
         if "object_dir" in train_data_cfg and (use_discriminator or needs_object_cycle)
         else None
@@ -873,6 +887,7 @@ def main() -> None:
             patch_size=tuple(config["data"].get("patch_size", [256, 256])),
             augment=bool(train_data_cfg.get("identity_augment", train_data_cfg.get("augment", True))),
             samples_per_epoch=train_data_cfg.get("identity_samples_per_epoch", train_data_cfg.get("samples_per_epoch")),
+            **self_norm_kwargs,
         )
         if identity_dir and identity_weight > 0
         else None

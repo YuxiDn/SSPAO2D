@@ -18,6 +18,15 @@ def test_psf_and_convolution_smoke():
     assert torch.isfinite(out).all()
 
 
+def test_convolution_preserves_amplitude_for_sum_normalized_psf():
+    img = torch.full((8, 8), 3.0)
+    psf = torch.ones(3, 3) / 9.0
+
+    out = convolve_fft2(img, psf)
+
+    assert torch.allclose(out, torch.full((1, 1, 8, 8), 3.0), atol=1e-6)
+
+
 def test_none_zernike_coefficients_mean_no_aberration():
     image_size = (32, 32)
     indices = tuple(range(3, 16))

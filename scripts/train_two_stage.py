@@ -280,18 +280,25 @@ def main() -> None:
     patch_size = tuple(config["data"].get("patch_size", [256, 256]))
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
     forward_model = AO2DForwardModel(patch_size, zernike_indices, make_optics_config(config)).to(device)
+    norm_kwargs = dict(
+        normalization_mode=str(config["data"].get("normalization_mode", "input_scale")),
+        input_scale_method=str(config["data"].get("input_scale_method", "percentile")),
+        input_scale_percentile=float(config["data"].get("input_scale_percentile", 99.9)),
+    )
 
     obj_set = AO2DSelfDataset(
         resolve_path(config["data"]["train"]["object_dir"], data_root),
         patch_size=patch_size,
         augment=bool(config["data"]["train"].get("augment", True)),
         samples_per_epoch=config["data"]["train"].get("object_samples_per_epoch"),
+        **norm_kwargs,
     )
     real_set = AO2DSelfDataset(
         resolve_path(config["data"]["train"]["aberrated_dir"], data_root),
         patch_size=patch_size,
         augment=bool(config["data"]["train"].get("augment", True)),
         samples_per_epoch=config["data"]["train"].get("aberrated_samples_per_epoch"),
+        **norm_kwargs,
     )
     val_set = (
         AO2DSelfDataset(
@@ -299,6 +306,7 @@ def main() -> None:
             patch_size=patch_size,
             augment=False,
             samples_per_epoch=config["data"]["val"].get("samples_per_epoch"),
+            **norm_kwargs,
         )
         if "val" in config["data"]
         else None

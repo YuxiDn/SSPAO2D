@@ -13,6 +13,9 @@
     "final_activation": "none"
   },
   "data": {
+    "normalization_mode": "input_scale",
+    "input_scale_method": "percentile",
+    "input_scale_percentile": 99.9,
     "patch_size": [
       512,
       512

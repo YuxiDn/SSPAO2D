@@ -5,6 +5,5 @@
   "base_channels": 32,
   "depth": 3,
   "norm": "batch",
-  "final_activation": "sigmoid"
+  "final_activation": null
 }
-

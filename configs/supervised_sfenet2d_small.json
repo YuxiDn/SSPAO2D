@@ -15,10 +15,13 @@
     "fft_forward": true,
     "unet_depth": 5,
     "num_pixel_stack_layer": 0,
-    "final_activation": "relu"
+    "final_activation": null
   },
   "data": {
     "root": "/data/yxdeng993/data/2Dsim",
+    "normalization_mode": "input_scale",
+    "input_scale_method": "percentile",
+    "input_scale_percentile": 99.9,
     "patch_size": [256, 256],
     "train": {
       "manifest": "metadata/manifest.csv",

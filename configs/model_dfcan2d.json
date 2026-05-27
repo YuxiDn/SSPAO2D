@@ -6,6 +6,5 @@
   "num_groups": 4,
   "num_blocks": 4,
   "reduction": 16,
-  "final_activation": "relu"
+  "final_activation": null
 }
-

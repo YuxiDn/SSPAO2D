@@ -8,6 +8,5 @@
   "reduction": 8,
   "bn": false,
   "residual_scale": 1.0,
-  "final_activation": "sigmoid"
+  "final_activation": null
 }
-
