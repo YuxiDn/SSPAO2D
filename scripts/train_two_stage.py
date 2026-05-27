@@ -87,7 +87,7 @@ def make_models(config: dict, device: torch.device) -> tuple[OBJGenerator2D, Abe
     obj_net = OBJGenerator2D(
         in_channels=int(model_cfg.get("in_channels", 1)),
         out_channels=int(model_cfg.get("out_channels", 1)),
-        final_activation=str(model_cfg.get("final_activation", "sigmoid")),
+        final_activation=model_cfg.get("final_activation", "sigmoid"),
     )
     coeff_net = AberrationGenerator2D(
         in_channels=int(model_cfg.get("in_channels", 1)),

@@ -33,7 +33,7 @@ def main() -> None:
         object_generator = OBJGenerator2D(
             in_channels=int(model_cfg.get("in_channels", 1)),
             out_channels=int(model_cfg.get("out_channels", 1)),
-            final_activation=str(model_cfg.get("final_activation", "sigmoid")),
+            final_activation=model_cfg.get("final_activation", "sigmoid"),
         ).to(device)
         aberration_generator = AberrationGenerator2D(
             in_channels=int(model_cfg.get("in_channels", 1)),

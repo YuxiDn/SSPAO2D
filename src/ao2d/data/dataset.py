@@ -276,6 +276,7 @@ class AO2DPairDataset(Dataset):
             scale = record.training_normalization_scale
             if scale is None:
                 raise ValueError(f"Missing training_normalization_scale for {record.aberrated}")
+            scale = max(float(scale), float(np.finfo(np.float32).eps))
             x = np.maximum(x_raw.astype(np.float32, copy=False), 0) / scale
             y = np.maximum(y_raw.astype(np.float32, copy=False), 0) / scale
         elif self.normalization_mode == "none":

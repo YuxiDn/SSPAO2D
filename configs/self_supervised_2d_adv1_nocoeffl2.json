@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data/yxdeng993/output/SSPAO2D/abesplit2d_self_supervised",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/abesplit2d_self_supervised_adv1_nocoeffl2",
   "model": {
     "name": "abesplit2d",
     "in_channels": 1,
@@ -74,7 +74,7 @@
     "gamma": 0.5,
     "min_lr": 0.000004,
     "weight_decay": 0.0,
-    "adversarial_weight": 0.001,
+    "adversarial_weight": 1.0,
     "cycle_aberrated_image_feature_weight": 50.0,
     "cycle_aberrated_image_l1_weight": 20.0,
     "cycle_object_weight": 60.0,
@@ -88,6 +88,6 @@
     "phase_loss_weight": 10.0,
     "phase_grad_loss_weight": 10.0,
     "tv_weight": 0.00001,
-    "coeff_l2": 0.0001
+    "coeff_l2": 0.0
   }
 }
