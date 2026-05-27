@@ -131,9 +131,45 @@ def metric_values(rows: list[dict[str, object]], key: str) -> list[float]:
     return values
 
 
+def training_float(training: dict, key: str, aliases: tuple[str, ...] = (), default: float = 0.0) -> float:
+    for candidate in (key, *aliases):
+        if candidate in training:
+            return float(training[candidate])
+    return float(default)
+
+
+def add_metric_aliases(rows: list[dict[str, object]]) -> None:
+    aliases = {
+        "cycle_aberrated_image_feature_loss": ("cycle_aberrated_loss",),
+        "cycle_aberrated_image_l1_loss": ("cycle_aberrated_l1_loss",),
+        "zernike_coeff_l1_loss": ("cycle_aberration_loss",),
+    }
+    for row in rows:
+        for new_key, old_keys in aliases.items():
+            if new_key in row:
+                continue
+            for old_key in old_keys:
+                if old_key in row:
+                    row[new_key] = row[old_key]
+                    break
+
+
 def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = path.exists()
+    if file_exists:
+        with path.open(newline="") as f:
+            rows = list(csv.reader(f))
+        if rows and rows[0] != fieldnames:
+            if len(rows[0]) != len(fieldnames):
+                raise ValueError(
+                    f"CSV schema mismatch for {path}: existing header has "
+                    f"{len(rows[0])} columns, new header has {len(fieldnames)} columns"
+                )
+            rows[0] = fieldnames
+            with path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -506,18 +542,26 @@ def loss_weights(config: dict) -> dict[str, float]:
     return {
         "tv": float(training.get("tv_weight", 1e-5)),
         "coeff_l2": float(training.get("coeff_l2", 1e-4)),
-        "cycle_aberrated": float(training.get("cycle_aberrated_weight", training.get("intensity_coefficient", 0.0))),
-        "cycle_aberrated_l1": float(
-            training.get(
-                "cycle_aberrated_l1_weight",
-                training.get("intensity_l1_coefficient", training.get("abeloss_l1_weight", 1.0)),
-            )
+        "cycle_aberrated_image_feature": training_float(
+            training,
+            "cycle_aberrated_image_feature_weight",
+            ("cycle_aberrated_weight", "intensity_coefficient"),
+        ),
+        "cycle_aberrated_image_l1": training_float(
+            training,
+            "cycle_aberrated_image_l1_weight",
+            ("cycle_aberrated_l1_weight", "intensity_l1_coefficient", "abeloss_l1_weight"),
+            default=1.0,
         ),
         "cycle_object": float(training.get("cycle_object_weight", training.get("pha_coefficient", 0.0))),
         "cycle_object_feature": float(
             training.get("cycle_object_feature_weight", training.get("feature_pha_coefficient", 0.0))
         ),
-        "cycle_aberration": float(training.get("cycle_aberration_weight", training.get("aberration_coefficient", 0.0))),
+        "zernike_coeff_l1": training_float(
+            training,
+            "zernike_coeff_l1_weight",
+            ("cycle_aberration_weight", "aberration_coefficient"),
+        ),
         "identity": float(training.get("identity_weight", training.get("identity_coefficient", 0.0))),
         "adversarial": adversarial_weight(config),
     }
@@ -549,7 +593,7 @@ def train_iteration(
     x = batch["input"].to(device, non_blocking=True)
 
     use_object_cycle = object_loader is not None and (
-        weights["cycle_object"] > 0 or weights["cycle_object_feature"] > 0 or weights["cycle_aberration"] > 0
+        weights["cycle_object"] > 0 or weights["cycle_object_feature"] > 0 or weights["zernike_coeff_l1"] > 0
     )
     use_identity = identity_loader is not None and weights["identity"] > 0
     real_obj = None
@@ -580,16 +624,16 @@ def train_iteration(
     coeff = coeff_parts[0]
     estimated = forward_model(restored, coeff)
 
-    loss_cycle_aberrated = weights["cycle_aberrated"] * feature_l1_loss(
+    loss_cycle_aberrated_image_feature = weights["cycle_aberrated_image_feature"] * feature_l1_loss(
         torch.sqrt(estimated.clamp_min(1e-8)),
         torch.sqrt(x.clamp_min(1e-8)),
     )
-    loss_cycle_aberrated_l1 = weights["cycle_aberrated_l1"] * F.l1_loss(estimated, x)
+    loss_cycle_aberrated_image_l1 = weights["cycle_aberrated_image_l1"] * F.l1_loss(estimated, x)
     loss_tv = weights["tv"] * total_variation_2d(restored)
     loss_coeff_l2 = weights["coeff_l2"] * torch.mean(coeff**2)
-    loss = loss_cycle_aberrated + loss_cycle_aberrated_l1 + loss_tv + loss_coeff_l2
+    loss = loss_cycle_aberrated_image_feature + loss_cycle_aberrated_image_l1 + loss_tv + loss_coeff_l2
     loss_cycle_object = x.new_zeros(())
-    loss_cycle_aberration = x.new_zeros(())
+    loss_zernike_coeff_l1 = x.new_zeros(())
     loss_identity = x.new_zeros(())
     loss_adv = x.new_zeros(())
     loss_adv_weighted = x.new_zeros(())
@@ -604,8 +648,8 @@ def train_iteration(
             weights["cycle_object"] * F.l1_loss(restored_obj, real_obj)
             + weights["cycle_object_feature"] * feature_l1_loss(restored_obj, real_obj)
         )
-        loss_cycle_aberration = weights["cycle_aberration"] * F.l1_loss(pred_coeff, target_coeff)
-        loss = loss + loss_cycle_object + loss_cycle_aberration
+        loss_zernike_coeff_l1 = weights["zernike_coeff_l1"] * F.l1_loss(pred_coeff, target_coeff)
+        loss = loss + loss_cycle_object + loss_zernike_coeff_l1
 
     if use_identity and clean_obj is not None:
         identity_restored = restored_parts[part_idx]
@@ -646,10 +690,10 @@ def train_iteration(
         "loss": float(loss.detach()),
         "loss_adv": float(loss_adv_weighted.detach()),
         "loss_D": float(loss_D.detach()),
-        "loss_cycle_aberrated": float(loss_cycle_aberrated.detach()),
-        "loss_cycle_aberrated_l1": float(loss_cycle_aberrated_l1.detach()),
+        "loss_cycle_aberrated_image_feature": float(loss_cycle_aberrated_image_feature.detach()),
+        "loss_cycle_aberrated_image_l1": float(loss_cycle_aberrated_image_l1.detach()),
         "loss_cycle_object": float(loss_cycle_object.detach()),
-        "loss_cycle_aberration": float(loss_cycle_aberration.detach()),
+        "loss_zernike_coeff_l1": float(loss_zernike_coeff_l1.detach()),
         "loss_identity": float(loss_identity.detach()),
         "cycle_psnr": float(psnr(x, estimated).detach()),
         "cycle_ssim": float(ssim(x, estimated).detach()),
@@ -688,28 +732,46 @@ def run_epoch(
     if train:
         totals["grad_norm"] = 0.0
     if train:
-        totals["loss_cycle_aberrated"] = 0.0
-        totals["loss_cycle_aberrated_l1"] = 0.0
+        totals["loss_cycle_aberrated_image_feature"] = 0.0
+        totals["loss_cycle_aberrated_image_l1"] = 0.0
         totals["loss_cycle_object"] = 0.0
-        totals["loss_cycle_aberration"] = 0.0
+        totals["loss_zernike_coeff_l1"] = 0.0
         totals["loss_identity"] = 0.0
     if train and discriminator is not None:
         totals["loss_adv"] = 0.0
         totals["loss_D"] = 0.0
+    if not train:
+        totals["object_psnr"] = 0.0
+        totals["object_ssim"] = 0.0
+        totals["object_rmse"] = 0.0
+        totals["object_pcc"] = 0.0
+        totals["zernike_mae"] = 0.0
+        totals["zernike_rmse"] = 0.0
+        totals["object_count"] = 0.0
+        totals["zernike_count"] = 0.0
     tv_weight = float(config["training"].get("tv_weight", 1e-5))
     coeff_l2 = float(config["training"].get("coeff_l2", 1e-4))
-    cycle_aberrated_weight = float(config["training"].get("cycle_aberrated_weight", config["training"].get("intensity_coefficient", 0.0)))
-    cycle_aberrated_l1_weight = float(
-        config["training"].get(
-            "cycle_aberrated_l1_weight",
-            config["training"].get("intensity_l1_coefficient", config["training"].get("abeloss_l1_weight", 1.0)),
-        )
+    training = config["training"]
+    cycle_aberrated_image_feature_weight = training_float(
+        training,
+        "cycle_aberrated_image_feature_weight",
+        ("cycle_aberrated_weight", "intensity_coefficient"),
+    )
+    cycle_aberrated_image_l1_weight = training_float(
+        training,
+        "cycle_aberrated_image_l1_weight",
+        ("cycle_aberrated_l1_weight", "intensity_l1_coefficient", "abeloss_l1_weight"),
+        default=1.0,
     )
     cycle_object_weight = float(config["training"].get("cycle_object_weight", config["training"].get("pha_coefficient", 0.0)))
     cycle_object_feature_weight = float(
         config["training"].get("cycle_object_feature_weight", config["training"].get("feature_pha_coefficient", 0.0))
     )
-    cycle_aberration_weight = float(config["training"].get("cycle_aberration_weight", config["training"].get("aberration_coefficient", 0.0)))
+    zernike_coeff_l1_weight = training_float(
+        training,
+        "zernike_coeff_l1_weight",
+        ("cycle_aberration_weight", "aberration_coefficient"),
+    )
     identity_weight = float(config["training"].get("identity_weight", config["training"].get("identity_coefficient", 0.0)))
     adv_weight = adversarial_weight(config)
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
@@ -723,20 +785,20 @@ def run_epoch(
                 raise RuntimeError("Self-supervised AO training requires a model that returns (restored, zernike_coeff), such as scare2d or picnet2d.")
             restored, coeff = output
             estimated = forward_model(restored, coeff)
-            loss_cycle_aberrated = cycle_aberrated_weight * feature_l1_loss(
+            loss_cycle_aberrated_image_feature = cycle_aberrated_image_feature_weight * feature_l1_loss(
                 torch.sqrt(estimated.clamp_min(1e-8)),
                 torch.sqrt(x.clamp_min(1e-8)),
             )
-            loss_cycle_aberrated_l1 = cycle_aberrated_l1_weight * F.l1_loss(estimated, x)
+            loss_cycle_aberrated_image_l1 = cycle_aberrated_image_l1_weight * F.l1_loss(estimated, x)
             loss_tv = tv_weight * total_variation_2d(restored)
             loss_coeff_l2 = coeff_l2 * torch.mean(coeff**2)
-            loss = loss_cycle_aberrated + loss_cycle_aberrated_l1 + loss_tv + loss_coeff_l2
+            loss = loss_cycle_aberrated_image_feature + loss_cycle_aberrated_image_l1 + loss_tv + loss_coeff_l2
             loss_cycle_object = x.new_zeros(())
-            loss_cycle_aberration = x.new_zeros(())
+            loss_zernike_coeff_l1 = x.new_zeros(())
             loss_identity = x.new_zeros(())
 
             if train:
-                if object_loader is not None and (cycle_object_weight > 0 or cycle_object_feature_weight > 0 or cycle_aberration_weight > 0):
+                if object_loader is not None and (cycle_object_weight > 0 or cycle_object_feature_weight > 0 or zernike_coeff_l1_weight > 0):
                     real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
                     target_coeff = random_coefficients_batch(real_obj.shape[0], zernike_indices, device, config).to(dtype=real_obj.dtype)
                     generated_aberrated = forward_model(real_obj, target_coeff).float()
@@ -745,8 +807,8 @@ def run_epoch(
                         cycle_object_weight * F.l1_loss(restored_obj, real_obj)
                         + cycle_object_feature_weight * feature_l1_loss(restored_obj, real_obj)
                     )
-                    loss_cycle_aberration = cycle_aberration_weight * F.l1_loss(pred_coeff, target_coeff)
-                    loss = loss + loss_cycle_object + loss_cycle_aberration
+                    loss_zernike_coeff_l1 = zernike_coeff_l1_weight * F.l1_loss(pred_coeff, target_coeff)
+                    loss = loss + loss_cycle_object + loss_zernike_coeff_l1
 
                 if identity_loader is not None and identity_weight > 0:
                     clean_obj, identity_iter = next_image_batch(identity_iter, identity_loader, device)
@@ -783,15 +845,61 @@ def run_epoch(
                 totals["grad_norm"] += grad_norm(model.parameters())
                 optimizer_G.step()
                 set_requires_grad(discriminator, True)
-                totals["loss_cycle_aberrated"] += float(loss_cycle_aberrated.detach())
-                totals["loss_cycle_aberrated_l1"] += float(loss_cycle_aberrated_l1.detach())
+                totals["loss_cycle_aberrated_image_feature"] += float(loss_cycle_aberrated_image_feature.detach())
+                totals["loss_cycle_aberrated_image_l1"] += float(loss_cycle_aberrated_image_l1.detach())
                 totals["loss_cycle_object"] += float(loss_cycle_object.detach())
-                totals["loss_cycle_aberration"] += float(loss_cycle_aberration.detach())
+                totals["loss_zernike_coeff_l1"] += float(loss_zernike_coeff_l1.detach())
                 totals["loss_identity"] += float(loss_identity.detach())
             totals["loss"] += float(loss.detach())
             totals["cycle_psnr"] += float(psnr(x, estimated).detach())
             totals["cycle_ssim"] += float(ssim(x, estimated).detach())
-    return {k: v / max(1, len(loader)) for k, v in totals.items()}
+
+            if not train:
+                data_root = get_data_root(config, None)
+                object_dir, zernike_dir = infer_validation_paths(config, data_root)
+                input_paths = batch.get("input_path", [])
+                if isinstance(input_paths, str):
+                    input_paths = [input_paths]
+                restored_cpu = restored.detach().cpu()
+                coeff_cpu = coeff.detach().cpu()
+                for sample_idx, input_path in enumerate(input_paths):
+                    object_path = matched_object_path(Path(str(input_path)), object_dir)
+                    if object_path is not None:
+                        target_np = normalize01(load_image(object_path), (0.1, 99.9))
+                        restored_np = restored_cpu[sample_idx, 0].numpy()
+                        target_np = center_crop_array(target_np, restored_np.shape)
+                        totals["object_psnr"] += float(
+                            psnr(torch.from_numpy(target_np)[None, None], torch.from_numpy(restored_np)[None, None])
+                        )
+                        totals["object_ssim"] += float(
+                            ssim(torch.from_numpy(target_np)[None, None], torch.from_numpy(restored_np)[None, None])
+                        )
+                        totals["object_rmse"] += rmse_np(restored_np, target_np)
+                        totals["object_pcc"] += pcc_np(restored_np, target_np)
+                        totals["object_count"] += 1.0
+
+                    coeff_path = matched_zernike_path(Path(str(input_path)), zernike_dir)
+                    true_coeff = load_zernike_coefficients(coeff_path) if coeff_path is not None else None
+                    if true_coeff is not None:
+                        pred_coeff = coeff_cpu[sample_idx].numpy()
+                        n = min(pred_coeff.shape[0], true_coeff.shape[0])
+                        diff = pred_coeff[:n] - true_coeff[:n]
+                        totals["zernike_mae"] += float(np.mean(np.abs(diff)))
+                        totals["zernike_rmse"] += float(np.sqrt(np.mean(diff**2)))
+                        totals["zernike_count"] += 1.0
+    averaged = {k: v / max(1, len(loader)) for k, v in totals.items()}
+    if not train:
+        object_count = max(1.0, totals.get("object_count", 0.0))
+        zernike_count = max(1.0, totals.get("zernike_count", 0.0))
+        for key in ("object_psnr", "object_ssim", "object_rmse", "object_pcc"):
+            if key in totals:
+                averaged[key] = totals[key] / object_count
+        for key in ("zernike_mae", "zernike_rmse"):
+            if key in totals:
+                averaged[key] = totals[key] / zernike_count
+        averaged["object_count"] = totals.get("object_count", 0.0)
+        averaged["zernike_count"] = totals.get("zernike_count", 0.0)
+    return averaged
 
 
 def main() -> None:
@@ -846,13 +954,11 @@ def main() -> None:
     val_set = make_self_dataset(config, "val", data_root) if "val" in config["data"] else None
     train_sampler = make_sampler(train_set, ctx, shuffle=True)
     val_sampler = make_sampler(val_set, ctx, shuffle=False)
-    needs_object_cycle = any(
-        float(config["training"].get(key, config["training"].get(alias, 0.0))) > 0
-        for key, alias in (
-            ("cycle_object_weight", "pha_coefficient"),
-            ("cycle_object_feature_weight", "feature_pha_coefficient"),
-            ("cycle_aberration_weight", "aberration_coefficient"),
-        )
+    training = config["training"]
+    needs_object_cycle = (
+        training_float(training, "cycle_object_weight", ("pha_coefficient",)) > 0
+        or training_float(training, "cycle_object_feature_weight", ("feature_pha_coefficient",)) > 0
+        or training_float(training, "zernike_coeff_l1_weight", ("cycle_aberration_weight", "aberration_coefficient")) > 0
     )
     object_set = (
         AO2DSelfDataset(
@@ -929,15 +1035,16 @@ def main() -> None:
     val_metrics_path = metrics_dir / "val_metrics"
     train_rows = read_metrics_xlsx(train_metrics_path.with_suffix(".xlsx")) if args.resume else []
     val_rows = read_metrics_xlsx(val_metrics_path.with_suffix(".xlsx")) if args.resume else []
+    add_metric_aliases(train_rows)
     best = min(metric_values(val_rows, "loss"), default=float("inf"))
     start_iteration = 1
     loss_history = {
         "G_adversarial_loss": [],
         "D_adversarial_loss": [],
-        "G_cycle_aberrated_loss": [],
-        "G_cycle_aberrated_l1_loss": [],
+        "G_cycle_aberrated_image_feature_loss": [],
+        "G_cycle_aberrated_image_l1_loss": [],
         "G_cycle_object_loss": [],
-        "G_cycle_aberration_loss": [],
+        "G_zernike_coeff_l1_loss": [],
         "G_identity_clean_loss": [],
     }
 
@@ -1027,10 +1134,14 @@ def main() -> None:
 
             loss_history["G_adversarial_loss"].append(round(train_metrics.get("loss_adv", 0.0), 6))
             loss_history["D_adversarial_loss"].append(round(train_metrics.get("loss_D", 0.0), 6))
-            loss_history["G_cycle_aberrated_loss"].append(round(train_metrics.get("loss_cycle_aberrated", 0.0), 6))
-            loss_history["G_cycle_aberrated_l1_loss"].append(round(train_metrics.get("loss_cycle_aberrated_l1", 0.0), 6))
+            loss_history["G_cycle_aberrated_image_feature_loss"].append(
+                round(train_metrics.get("loss_cycle_aberrated_image_feature", 0.0), 6)
+            )
+            loss_history["G_cycle_aberrated_image_l1_loss"].append(
+                round(train_metrics.get("loss_cycle_aberrated_image_l1", 0.0), 6)
+            )
             loss_history["G_cycle_object_loss"].append(round(train_metrics.get("loss_cycle_object", 0.0), 6))
-            loss_history["G_cycle_aberration_loss"].append(round(train_metrics.get("loss_cycle_aberration", 0.0), 6))
+            loss_history["G_zernike_coeff_l1_loss"].append(round(train_metrics.get("loss_zernike_coeff_l1", 0.0), 6))
             loss_history["G_identity_clean_loss"].append(round(train_metrics.get("loss_identity", 0.0), 6))
 
             val_metrics = None
@@ -1057,10 +1168,10 @@ def main() -> None:
                     "time_sec": round(elapsed, 4),
                     "G_adversarial_loss": train_metrics.get("loss_adv"),
                     "D_adversarial_loss": train_metrics.get("loss_D"),
-                    "cycle_aberrated_loss": train_metrics.get("loss_cycle_aberrated"),
-                    "cycle_aberrated_l1_loss": train_metrics.get("loss_cycle_aberrated_l1"),
+                    "cycle_aberrated_image_feature_loss": train_metrics.get("loss_cycle_aberrated_image_feature"),
+                    "cycle_aberrated_image_l1_loss": train_metrics.get("loss_cycle_aberrated_image_l1"),
                     "cycle_object_loss": train_metrics.get("loss_cycle_object"),
-                    "cycle_aberration_loss": train_metrics.get("loss_cycle_aberration"),
+                    "zernike_coeff_l1_loss": train_metrics.get("loss_zernike_coeff_l1"),
                     "identity_clean_loss": train_metrics.get("loss_identity"),
                     "total_loss": train_metrics.get("loss"),
                     "cycle_psnr": train_metrics.get("cycle_psnr"),
@@ -1106,6 +1217,14 @@ def main() -> None:
                         "loss": val_metrics.get("loss"),
                         "cycle_psnr": val_metrics.get("cycle_psnr"),
                         "cycle_ssim": val_metrics.get("cycle_ssim"),
+                        "object_psnr": val_metrics.get("object_psnr"),
+                        "object_ssim": val_metrics.get("object_ssim"),
+                        "object_rmse": val_metrics.get("object_rmse"),
+                        "object_pcc": val_metrics.get("object_pcc"),
+                        "zernike_mae": val_metrics.get("zernike_mae"),
+                        "zernike_rmse": val_metrics.get("zernike_rmse"),
+                        "object_count": val_metrics.get("object_count"),
+                        "zernike_count": val_metrics.get("zernike_count"),
                     }
                     append_metrics_row(val_metrics_path, val_rows, val_row)
                     if val_metrics["loss"] <= best:
