@@ -617,6 +617,21 @@ def loss_weights(config: dict) -> dict[str, float]:
         "phase": float(training.get("phase_loss_weight", 0.0)),
         "phase_grad": float(training.get("phase_grad_loss_weight", 0.0)),
         "identity": float(training.get("identity_weight", training.get("identity_coefficient", 0.0))),
+        "random_reaberration_object": training_float(
+            training,
+            "random_reaberration_object_weight",
+            ("reaberration_object_weight", "random_object_consistency_weight"),
+        ),
+        "random_reaberration_feature": training_float(
+            training,
+            "random_reaberration_feature_weight",
+            ("reaberration_feature_weight", "random_object_feature_consistency_weight"),
+        ),
+        "random_reaberration_coeff": training_float(
+            training,
+            "random_reaberration_coeff_weight",
+            ("reaberration_coeff_weight", "random_zernike_consistency_weight"),
+        ),
         "adversarial": adversarial_weight(config),
     }
 
@@ -691,6 +706,8 @@ def train_iteration(
     loss_phase = x.new_zeros(())
     loss_phase_grad = x.new_zeros(())
     loss_identity = x.new_zeros(())
+    loss_random_reaberration_object = x.new_zeros(())
+    loss_random_reaberration_coeff = x.new_zeros(())
     loss_adv = x.new_zeros(())
     loss_adv_weighted = x.new_zeros(())
     loss_D = x.new_zeros(())
@@ -723,6 +740,27 @@ def train_iteration(
         identity_estimated = forward_model(identity_restored, zero_coeff).float()
         loss_identity = weights["identity"] * F.l1_loss(identity_estimated, clean_obj)
         loss = loss + loss_identity
+
+    if (
+        weights["random_reaberration_object"] > 0
+        or weights["random_reaberration_feature"] > 0
+        or weights["random_reaberration_coeff"] > 0
+    ):
+        restored_ref = restored.detach()
+        random_coeff = random_coefficients_batch(restored_ref.shape[0], zernike_indices, device, config).to(
+            dtype=restored_ref.dtype
+        )
+        random_aberrated = forward_model(restored_ref, random_coeff).float().detach()
+        random_restored, random_pred_coeff = model(random_aberrated)
+        loss_random_reaberration_object = (
+            weights["random_reaberration_object"] * F.l1_loss(random_restored, restored_ref)
+            + weights["random_reaberration_feature"] * feature_l1_loss(random_restored, restored_ref)
+        )
+        loss_random_reaberration_coeff = weights["random_reaberration_coeff"] * F.l1_loss(
+            random_pred_coeff,
+            random_coeff,
+        )
+        loss = loss + loss_random_reaberration_object + loss_random_reaberration_coeff
 
     if discriminator is not None and optimizer_D is not None and weights["adversarial"] > 0:
         if real_obj is None:
@@ -763,6 +801,8 @@ def train_iteration(
         "loss_phase": float(loss_phase.detach()),
         "loss_phase_grad": float(loss_phase_grad.detach()),
         "loss_identity": float(loss_identity.detach()),
+        "loss_random_reaberration_object": float(loss_random_reaberration_object.detach()),
+        "loss_random_reaberration_coeff": float(loss_random_reaberration_coeff.detach()),
         "cycle_psnr": float(psnr(x, estimated).detach()),
         "cycle_ssim": float(ssim(x, estimated).detach()),
         "grad_norm": float(grad),
@@ -1159,6 +1199,8 @@ def main() -> None:
         "G_phase_loss": [],
         "G_phase_grad_loss": [],
         "G_identity_clean_loss": [],
+        "G_random_reaberration_object_loss": [],
+        "G_random_reaberration_coeff_loss": [],
     }
 
     if args.resume:
@@ -1258,6 +1300,12 @@ def main() -> None:
             loss_history["G_phase_loss"].append(round(train_metrics.get("loss_phase", 0.0), 6))
             loss_history["G_phase_grad_loss"].append(round(train_metrics.get("loss_phase_grad", 0.0), 6))
             loss_history["G_identity_clean_loss"].append(round(train_metrics.get("loss_identity", 0.0), 6))
+            loss_history["G_random_reaberration_object_loss"].append(
+                round(train_metrics.get("loss_random_reaberration_object", 0.0), 6)
+            )
+            loss_history["G_random_reaberration_coeff_loss"].append(
+                round(train_metrics.get("loss_random_reaberration_coeff", 0.0), 6)
+            )
 
             val_metrics = None
             if val_loader is not None and iteration % model_chk_iter == 0:
@@ -1290,6 +1338,8 @@ def main() -> None:
                     "phase_loss": train_metrics.get("loss_phase"),
                     "phase_grad_loss": train_metrics.get("loss_phase_grad"),
                     "identity_clean_loss": train_metrics.get("loss_identity"),
+                    "random_reaberration_object_loss": train_metrics.get("loss_random_reaberration_object"),
+                    "random_reaberration_coeff_loss": train_metrics.get("loss_random_reaberration_coeff"),
                     "total_loss": train_metrics.get("loss"),
                     "cycle_psnr": train_metrics.get("cycle_psnr"),
                     "cycle_ssim": train_metrics.get("cycle_ssim"),

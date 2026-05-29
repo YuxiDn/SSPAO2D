@@ -87,6 +87,9 @@
     "zernike_include_defocus": true,
     "phase_loss_weight": 10.0,
     "phase_grad_loss_weight": 10.0,
+    "random_reaberration_object_weight": 5.0,
+    "random_reaberration_feature_weight": 0.0,
+    "random_reaberration_coeff_weight": 5.0,
     "tv_weight": 0.00001,
     "coeff_l2": 0.0
   }
