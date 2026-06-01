@@ -4,7 +4,18 @@ from typing import Any
 
 import torch.nn as nn
 
-from . import ABESplitNet2D, ABEFusionNet2D, ABEFusionNetV2D, CARE2D, DFCAN2D, PICNet2D, RCAN2D, SCARE2D, SFENet2D
+from . import (
+    ABESplitNet2D,
+    ABEFusionNet2D,
+    ABEFusionNetV2D,
+    CARE2D,
+    DFCAN2D,
+    PICNet2D,
+    RCAN2D,
+    RLN2D,
+    SCARE2D,
+    SFENet2D,
+)
 
 
 def make_model(config: dict[str, Any]) -> nn.Module:
@@ -57,6 +68,23 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             num_groups=int(config.get("num_groups", config.get("num_residual_groups", 4))),
             num_blocks=int(config.get("num_blocks", config.get("num_residual_blocks", 4))),
             reduction=int(config.get("reduction", 16)),
+        )
+    if name in {"rln", "rln2d", "richardson_lucy_net", "richardson-lucy-net"}:
+        return RLN2D(
+            in_channels=int(config.get("in_channels", 1)),
+            out_channels=int(config.get("out_channels", 1)),
+            num_features=int(config.get("num_features", config.get("base_channels", 8))),
+            num_iterations=int(config.get("num_iterations", config.get("iterations", 1))),
+            kernel_size=int(config.get("kernel_size", 3)),
+            norm=str(config.get("norm", "batch")),
+            eps=float(config.get("eps", 1e-4)),
+            ratio_clip=(
+                None
+                if config.get("ratio_clip", 10.0) is None
+                else float(config.get("ratio_clip", config.get("clip_ratio", 10.0)))
+            ),
+            residual=bool(config.get("residual", False)),
+            final_activation=config.get("final_activation", "softplus"),
         )
     if name in {"sfenet", "sfenet2d", "sfe"}:
         return SFENet2D(

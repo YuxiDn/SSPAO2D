@@ -18,6 +18,7 @@ The code is organized for 2-D image workflows while keeping model families commo
   - DFCAN2D
   - SFENet2D
   - PICNet2D
+  - RLN2D
 
 ## Repository Structure
 
@@ -37,6 +38,7 @@ scripts/
 
 configs/
   supervised_2d.json
+  supervised_rln2d.json
   self_supervised_2d.json
   two_stage_2d.json
   model_care2d.json
@@ -45,6 +47,7 @@ configs/
   model_dfcan2d.json
   model_sfenet2d.json
   model_picnet2d.json
+  model_rln2d.json
 ```
 
 ## Installation
@@ -74,7 +77,7 @@ scare2d
 Baseline model names:
 
 ```text
-care2d, rcan2d, dfcan2d, sfenet2d, picnet2d
+care2d, rcan2d, dfcan2d, sfenet2d, picnet2d, rln2d
 ```
 
 Model configuration examples are provided in `configs/model_*.json`.
