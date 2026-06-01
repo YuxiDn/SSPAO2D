@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR, ReduceLROnPlateau, StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, MultiStepLR, ReduceLROnPlateau, StepLR
 
 
 def _get(config: Mapping[str, object], key: str, default: object = None, prefix: str = "") -> object:
@@ -24,6 +24,7 @@ def _scheduler_name(config: Mapping[str, object], prefix: str = "") -> str:
     aliases = {
         "steplr": "step",
         "cosineannealinglr": "cosine",
+        "exponentialsteplr": "exponential_step",
         "multisteplr": "multistep",
         "reducelronplateau": "plateau",
     }
@@ -53,6 +54,15 @@ def build_scheduler(
     if name == "cosine":
         t_max = int(_get(training_config, "T_max", total_epochs, prefix))
         return CosineAnnealingLR(optimizer, T_max=max(1, t_max), eta_min=min_lr)
+    if name in {"exponential", "exponential_step"}:
+        decay_steps = float(_get(training_config, "decay_steps", 600, prefix))
+        if decay_steps <= 0:
+            raise ValueError("decay_steps must be positive for exponential_step scheduler.")
+        lr_lambdas = [
+            (lambda step, base_lr=float(group["lr"]): max(min_lr / base_lr, gamma ** (float(step) / decay_steps)))
+            for group in optimizer.param_groups
+        ]
+        return LambdaLR(optimizer, lr_lambda=lr_lambdas)
     if name == "step":
         default_step = max(1, int(total_epochs) // 4)
         step_size = int(_get(training_config, "lr_step_size", _get(training_config, "step_size", default_step, prefix), prefix))

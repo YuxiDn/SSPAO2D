@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -68,32 +70,89 @@ def make_dataset(config: dict, split: str, data_root: Path | None = None):
     )
 
 
-def supervised_loss(pred: torch.Tensor, target: torch.Tensor, loss_name: str) -> torch.Tensor:
+def supervised_loss(
+    out: torch.Tensor | tuple[torch.Tensor, ...],
+    target: torch.Tensor,
+    loss_name: str,
+    input_tensor: torch.Tensor | None = None,
+) -> torch.Tensor:
     name = loss_name.lower()
+    pred = out[0] if isinstance(out, tuple) else out
     if name in {"l1", "mae"}:
         return F.l1_loss(pred, target)
     if name in {"mse", "l2"}:
         return F.mse_loss(pred, target)
+    if name in {"rln", "rln_loss", "richardson_lucy", "richardson_lucy_net"}:
+        aux = out[1] if isinstance(out, tuple) and len(out) > 1 else pred
+        aux_target = target
+        if input_tensor is not None and input_tensor.shape == target.shape:
+            aux_target = 0.8 * target + 0.2 * input_tensor
+        mse = F.mse_loss(pred, target) + 1e-4
+        aux_mse = F.mse_loss(aux, aux_target) + 1e-4
+        ssim_term = -torch.log(((1.0 + rln_global_ssim(target, pred)) / 2.0).clamp_min(1e-6))
+        return 0.1 * aux_mse + mse + ssim_term
     raise ValueError(f"Unsupported supervised loss: {loss_name}")
 
 
-def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool, loss_name: str = "l1"):
+def rln_global_ssim(target: torch.Tensor, pred: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
+    mean_pred = pred.mean()
+    mean_target = target.mean()
+    var_pred = (pred - mean_pred).square().mean()
+    var_target = (target - mean_target).square().mean()
+    cov = ((pred - mean_pred) * (target - mean_target)).mean()
+    c1 = 1e-4 * max_val * max_val
+    c2 = 9e-4 * max_val * max_val
+    numerator = (2 * mean_pred * mean_target + c1) * (2 * cov + c2)
+    denominator = (mean_pred.square() + mean_target.square() + c1) * (var_pred + var_target + c2)
+    return numerator / denominator.clamp_min(1e-8)
+
+
+def repeat_loader(loader):
+    while True:
+        yield from loader
+
+
+def run_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    train: bool,
+    show_progress: bool,
+    loss_name: str = "l1",
+    iterations: int | None = None,
+    scheduler=None,
+    scheduler_interval: str = "epoch",
+):
     model.train(train)
     totals = {"loss": 0.0, "psnr": 0.0, "ssim": 0.0, "pred_min": 0.0, "pred_max": 0.0, "pred_mean": 0.0}
     if train:
         totals["grad_norm"] = 0.0
+    total_steps = int(iterations) if iterations is not None else len(loader)
+    iterator = repeat_loader(loader) if iterations is not None else iter(loader)
     with torch.set_grad_enabled(train):
-        for batch in tqdm(loader, desc="train" if train else "val", leave=False, disable=not show_progress):
+        for batch in tqdm(
+            itertools.islice(iterator, total_steps),
+            total=total_steps,
+            desc="train" if train else "val",
+            leave=False,
+            disable=not show_progress,
+        ):
             x = batch["input"].to(device, non_blocking=True)
             y = batch["target"].to(device, non_blocking=True)
-            out = model(x)
+            if loss_name.lower() in {"rln", "rln_loss", "richardson_lucy", "richardson_lucy_net"}:
+                out = model(x, return_aux=True)
+            else:
+                out = model(x)
             pred = out[0] if isinstance(out, tuple) else out
-            loss = supervised_loss(pred, y, loss_name)
+            loss = supervised_loss(out, y, loss_name, x)
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 totals["grad_norm"] += grad_norm(model.parameters())
                 optimizer.step()
+                if scheduler is not None and scheduler_interval == "step":
+                    scheduler.step()
             totals["loss"] += float(loss.detach())
             totals["psnr"] += float(psnr(y, pred).detach())
             totals["ssim"] += float(ssim(y, pred).detach())
@@ -101,7 +160,7 @@ def run_epoch(model, loader, optimizer, device, train: bool, show_progress: bool
             totals["pred_min"] += float(pred_detached.amin())
             totals["pred_max"] += float(pred_detached.amax())
             totals["pred_mean"] += float(pred_detached.mean())
-    return {k: v / max(1, len(loader)) for k, v in totals.items()}
+    return {k: v / max(1, total_steps) for k, v in totals.items()}
 
 
 def load_checkpoint_model(path: str | Path, model, device, load_optimizer: bool = False, optimizer=None, scheduler=None) -> int:
@@ -162,6 +221,9 @@ def main() -> None:
     optimizer = build_optimizer(model.parameters(), config["training"])
     epochs = int(config["training"].get("epochs", 100))
     scheduler = build_scheduler(optimizer, config["training"], total_epochs=epochs)
+    scheduler_interval = str(config["training"].get("lr_scheduler_interval", "epoch")).lower()
+    if isinstance(scheduler, ReduceLROnPlateau):
+        scheduler_interval = "epoch"
     resume_epoch = 0
     if args.resume:
         resume_epoch = load_checkpoint_model(args.resume, model, device, args.resume_optimizer, optimizer, scheduler)
@@ -223,11 +285,24 @@ def main() -> None:
             set_sampler_epoch(train_sampler, epoch)
             set_sampler_epoch(val_sampler, epoch)
             loss_name = str(config["training"].get("loss", config["training"].get("loss_function", "l1")))
-            train_metrics = run_epoch(model, train_loader, optimizer, device, train=True, show_progress=ctx.is_main, loss_name=loss_name)
+            iterations_per_epoch = config["training"].get("iterations_per_epoch", config["training"].get("steps_per_epoch"))
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                train=True,
+                show_progress=ctx.is_main,
+                loss_name=loss_name,
+                iterations=int(iterations_per_epoch) if iterations_per_epoch is not None else None,
+                scheduler=scheduler,
+                scheduler_interval=scheduler_interval,
+            )
             val_metrics = run_epoch(model, val_loader, optimizer, device, train=False, show_progress=ctx.is_main, loss_name=loss_name) if val_loader else train_metrics
             train_metrics = reduce_metrics(train_metrics, ctx)
             val_metrics = reduce_metrics(val_metrics, ctx)
-            step_scheduler(scheduler, val_metrics["loss"])
+            if scheduler_interval != "step":
+                step_scheduler(scheduler, val_metrics["loss"])
             lr = get_current_lr(optimizer)
             if ctx.is_main:
                 print(f"epoch={epoch:04d} lr={lr:.6g} train={train_metrics} val={val_metrics}")

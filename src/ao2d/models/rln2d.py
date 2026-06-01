@@ -117,9 +117,10 @@ class RLN2D(nn.Module):
             ratio = ratio.clamp(max=self.ratio_clip)
         return ratio
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_aux: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         anchor = self.input_projection(x)
         estimate = self.estimator(x).clamp_min(self.eps)
+        aux = estimate
 
         for forward_blur, backprojection, refiner in zip(self.forward_blurs, self.backprojections, self.refiners):
             blurred = F.softplus(forward_blur(estimate), beta=1.0).clamp_min(self.eps)
@@ -129,4 +130,7 @@ class RLN2D(nn.Module):
 
         if self.residual:
             estimate = estimate + anchor
-        return self.activation(estimate)
+        estimate = self.activation(estimate)
+        if return_aux:
+            return estimate, aux
+        return estimate

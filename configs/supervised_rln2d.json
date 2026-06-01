@@ -16,7 +16,7 @@
   "data": {
     "normalization_mode": "input_scale",
     "input_scale_method": "percentile",
-    "input_scale_percentile": 99.9,
+    "input_scale_percentile": 99.5,
     "patch_size": [512, 512],
     "train": {
       "manifest": "metadata/manifest.csv",
@@ -34,15 +34,18 @@
     }
   },
   "training": {
-    "epochs": 200,
-    "batch_size": 4,
+    "epochs": 100,
+    "batch_size": 128,
     "num_workers": 4,
     "optimizer": "Adam",
-    "initial_learning_rate": 0.0001,
-    "lr_scheduler": "StepLR",
+    "initial_learning_rate": 0.001,
+    "loss": "rln",
+    "iterations_per_epoch": 100,
+    "lr_scheduler": "exponential_step",
+    "lr_scheduler_interval": "step",
     "min_lr": 1e-06,
     "weight_decay": 0.0,
-    "step_size": 50,
-    "gamma": 0.5
+    "decay_steps": 600,
+    "gamma": 0.95
   }
 }
