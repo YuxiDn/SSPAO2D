@@ -6,6 +6,7 @@ import torch.nn as nn
 from .blocks import output_activation
 from .scare2d import SobelGradient2D, ZernikeResNetRegression2D
 from .sfenet2d import ResUNet2D
+from .zernike_projection import DeltaPhiZernikeProjectionHead2D, PupilPhaseZernikeProjectionHead2D
 
 
 class ResidualConvBlock2D(nn.Module):
@@ -62,6 +63,84 @@ class LogFFTAmplitude2D(nn.Module):
         return (amp - mean) / std
 
 
+class LogFFTAmplitudePhase2D(nn.Module):
+    """Normalized FFT amplitude plus wrapped phase represented as cosine/sine channels."""
+
+    def __init__(self, fft: bool = True, fft_shift: bool = False) -> None:
+        super().__init__()
+        self.fft = fft
+        self.fft_shift = fft_shift
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.fft:
+            return x
+        spectrum = torch.fft.fft2(x.float(), dim=(-2, -1))
+        if self.fft_shift:
+            spectrum = torch.fft.fftshift(spectrum, dim=(-2, -1))
+
+        amp = torch.log10(1 + torch.abs(spectrum).clamp_min(1e-8))
+        mean = amp.mean(dim=(-2, -1), keepdim=True)
+        std = amp.std(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        amp = (amp - mean) / std
+
+        denom = torch.abs(spectrum).clamp_min(1e-8)
+        cos_phase = spectrum.real / denom
+        sin_phase = spectrum.imag / denom
+        return torch.cat([amp, cos_phase, sin_phase], dim=1)
+
+
+def make_aberration_head_2d(
+    in_channels: int,
+    zernike_modes: int,
+    hidden: int,
+    depth: int,
+    reduction: int,
+    head_type: str = "direct",
+    zernike_indices: tuple[int, ...] | None = None,
+    delta_phi_pair_count: int = 512,
+    delta_phi_pupil_grid_size: int = 32,
+    delta_phi_ridge: float = 1e-4,
+    delta_phi_max_opd: float | None = 0.75,
+) -> nn.Module:
+    head_type = str(head_type).lower()
+    indices = tuple(range(3, 3 + zernike_modes)) if zernike_indices is None else tuple(int(v) for v in zernike_indices)
+    if len(indices) != zernike_modes:
+        raise ValueError("zernike_indices length must match zernike_modes")
+    if head_type in {"direct", "coefficient", "coeff", "mlp"}:
+        return ZernikeResNetRegression2D(
+            in_channels,
+            zernike_modes,
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+        )
+    if head_type in {"delta_phi_projection", "difference_projection", "zernike_difference_projection"}:
+        return DeltaPhiZernikeProjectionHead2D(
+            in_channels,
+            indices,
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+            pair_count=delta_phi_pair_count,
+            pupil_grid_size=delta_phi_pupil_grid_size,
+            ridge=delta_phi_ridge,
+            max_delta_opd=delta_phi_max_opd,
+        )
+    if head_type in {"pupil_phase_projection", "phase_projection", "pupil_phase"}:
+        return PupilPhaseZernikeProjectionHead2D(
+            in_channels,
+            indices,
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+            pair_count=delta_phi_pair_count,
+            pupil_grid_size=delta_phi_pupil_grid_size,
+            ridge=delta_phi_ridge,
+            max_phase_opd=delta_phi_max_opd,
+        )
+    raise ValueError(f"Unsupported aberration_head_type: {head_type}")
+
+
 class ABEFusionNet2D(nn.Module):
     """SFE/PICNet-style model for aberrated input.
 
@@ -83,8 +162,15 @@ class ABEFusionNet2D(nn.Module):
         zernike_hidden: int = 128,
         zernike_depth: int = 3,
         zernike_reduction: int = 8,
+        zernike_indices: tuple[int, ...] | None = None,
+        aberration_head_type: str = "direct",
+        delta_phi_pair_count: int = 512,
+        delta_phi_pupil_grid_size: int = 32,
+        delta_phi_ridge: float = 1e-4,
+        delta_phi_max_opd: float | None = 0.75,
         fft: bool = True,
         fft_shift: bool = False,
+        fft_phase_features: bool = False,
         num_pixel_stack_layer: int = 0,
         final_activation: str = "sigmoid",
     ) -> None:
@@ -95,10 +181,15 @@ class ABEFusionNet2D(nn.Module):
             raise ValueError("fusion_channels must be positive")
 
         self.gradient_transform = SobelGradient2D(in_channels)
-        self.frequency_transform = LogFFTAmplitude2D(fft=fft, fft_shift=fft_shift)
+        self.frequency_transform = (
+            LogFFTAmplitudePhase2D(fft=fft, fft_shift=fft_shift)
+            if fft_phase_features
+            else LogFFTAmplitude2D(fft=fft, fft_shift=fft_shift)
+        )
+        frequency_channels = in_channels * 3 if fft and fft_phase_features else in_channels
         self.image_branch = BranchEncoder2D(in_channels, branch_channels, depth=branch_depth)
         self.gradient_branch = BranchEncoder2D(in_channels, branch_channels, depth=branch_depth)
-        self.frequency_branch = BranchEncoder2D(in_channels, branch_channels, depth=branch_depth)
+        self.frequency_branch = BranchEncoder2D(frequency_channels, branch_channels, depth=branch_depth)
         self.fusion = nn.Sequential(
             nn.Conv2d(branch_channels * 3, fusion_channels, 1, bias=False),
             nn.BatchNorm2d(fusion_channels),
@@ -111,12 +202,18 @@ class ABEFusionNet2D(nn.Module):
             depth=obj_depth,
             num_pixel_stack_layer=num_pixel_stack_layer,
         )
-        self.zernike_head = ZernikeResNetRegression2D(
+        self.zernike_head = make_aberration_head_2d(
             fusion_channels,
             zernike_modes,
-            hidden=zernike_hidden,
-            depth=zernike_depth,
-            reduction=zernike_reduction,
+            zernike_hidden,
+            zernike_depth,
+            zernike_reduction,
+            head_type=aberration_head_type,
+            zernike_indices=zernike_indices,
+            delta_phi_pair_count=delta_phi_pair_count,
+            delta_phi_pupil_grid_size=delta_phi_pupil_grid_size,
+            delta_phi_ridge=delta_phi_ridge,
+            delta_phi_max_opd=delta_phi_max_opd,
         )
         self.activation = output_activation(final_activation)
 

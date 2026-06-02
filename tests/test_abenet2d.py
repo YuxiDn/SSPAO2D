@@ -1,6 +1,11 @@
 import torch
 
-from ao2d.models import ABESplitNet2D, ABEFusionNet2D
+from ao2d.models import (
+    ABESplitNet2D,
+    ABEFusionNet2D,
+    DeltaPhiZernikeProjectionHead2D,
+    PupilPhaseZernikeProjectionHead2D,
+)
 from ao2d.models.factory import make_model
 
 
@@ -109,3 +114,102 @@ def test_factory_builds_abesplit2d_with_split_options():
     assert model.abe_fusion[0].in_channels == 15
     assert model.frequency_transform.fft is False
     assert model.frequency_transform.fft_shift is True
+
+
+def test_delta_phi_projection_head_returns_zernike_coefficients():
+    x = torch.rand(2, 12, 8, 8)
+    head = DeltaPhiZernikeProjectionHead2D(
+        in_channels=12,
+        zernike_indices=tuple(range(3, 8)),
+        hidden=8,
+        depth=1,
+        pair_count=32,
+        pupil_grid_size=12,
+    )
+
+    coeff = head(x)
+
+    assert coeff.shape == (2, 5)
+    assert torch.isfinite(coeff).all()
+
+
+def test_factory_builds_abesplit2d_with_delta_phi_projection_head():
+    model = make_model(
+        {
+            "name": "abesplit2d",
+            "in_channels": 1,
+            "out_channels": 1,
+            "zernike_modes": 5,
+            "zernike_indices": [3, 4, 5, 6, 7],
+            "branch_channels": 4,
+            "fusion_channels": 12,
+            "branch_depth": 1,
+            "obj_base_channels": 8,
+            "obj_depth": 1,
+            "zernike_hidden": 16,
+            "zernike_depth": 1,
+            "aberration_head_type": "delta_phi_projection",
+            "delta_phi_pair_count": 32,
+            "delta_phi_pupil_grid_size": 12,
+            "fft": False,
+            "final_activation": "none",
+        }
+    )
+    x = torch.rand(2, 1, 32, 32)
+
+    obj, zernike = model(x)
+
+    assert obj.shape == x.shape
+    assert zernike.shape == (2, 5)
+
+
+def test_pupil_phase_projection_head_returns_zernike_coefficients():
+    x = torch.rand(2, 12, 8, 8)
+    head = PupilPhaseZernikeProjectionHead2D(
+        in_channels=12,
+        zernike_indices=tuple(range(3, 8)),
+        hidden=8,
+        depth=1,
+        pair_count=32,
+        pupil_grid_size=12,
+    )
+
+    coeff = head(x)
+    phase = head.forward_phase(x)
+    delta = head.forward_delta(x)
+
+    assert coeff.shape == (2, 5)
+    assert phase.shape == (2, 12, 12)
+    assert delta.shape == (2, head.projection.pair_count)
+    assert torch.isfinite(coeff).all()
+
+
+def test_factory_builds_abesplit2d_with_fft_phase_and_pupil_phase_projection_head():
+    model = make_model(
+        {
+            "name": "abesplit2d",
+            "in_channels": 1,
+            "out_channels": 1,
+            "zernike_modes": 5,
+            "zernike_indices": [3, 4, 5, 6, 7],
+            "branch_channels": 4,
+            "fusion_channels": 12,
+            "branch_depth": 1,
+            "obj_base_channels": 8,
+            "obj_depth": 1,
+            "zernike_hidden": 16,
+            "zernike_depth": 1,
+            "aberration_head_type": "pupil_phase_projection",
+            "delta_phi_pair_count": 32,
+            "delta_phi_pupil_grid_size": 12,
+            "fft": True,
+            "fft_phase_features": True,
+            "final_activation": "none",
+        }
+    )
+    x = torch.rand(2, 1, 32, 32)
+
+    obj, zernike = model(x)
+
+    assert obj.shape == x.shape
+    assert zernike.shape == (2, 5)
