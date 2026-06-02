@@ -82,6 +82,9 @@ def supervised_loss(
         return F.l1_loss(pred, target)
     if name in {"mse", "l2"}:
         return F.mse_loss(pred, target)
+    if name in {"l1_ssim", "ssim_l1", "structure", "structural"}:
+        ssim_loss = 1.0 - ssim(target, pred).clamp(min=-1.0, max=1.0)
+        return 0.5 * F.l1_loss(pred, target) + 0.5 * ssim_loss
     if name in {"rln", "rln_loss", "richardson_lucy", "richardson_lucy_net"}:
         aux = out[1] if isinstance(out, tuple) and len(out) > 1 else pred
         aux_target = target

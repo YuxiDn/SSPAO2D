@@ -6,6 +6,7 @@ from .optics import (
     generate_psf2d_from_zernike,
     random_zernike_coefficients,
     zernike_index_to_nm,
+    zernike_mode,
     zernike_wavefront,
     pupil_coordinates_2d
 )
@@ -16,6 +17,7 @@ __all__ = [
     "generate_psf2d_from_zernike",
     "random_zernike_coefficients",
     "zernike_index_to_nm",
+    "zernike_mode",
     "zernike_wavefront",
     "pupil_coordinates_2d"
 ]

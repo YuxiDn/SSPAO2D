@@ -4,6 +4,8 @@ from typing import Any
 
 import torch.nn as nn
 
+from ao2d.optics import AO2DConfig
+
 from . import (
     ABESplitNet2D,
     ABEFusionNet2D,
@@ -16,6 +18,62 @@ from . import (
     SCARE2D,
     SFENet2D,
 )
+
+
+def _as_tuple(values: Any) -> tuple | None:
+    if values is None:
+        return None
+    if isinstance(values, (list, tuple)):
+        return tuple(values)
+    return (values,)
+
+
+def _make_template_optics_config(config: dict[str, Any]) -> AO2DConfig:
+    template_cfg = config.get("template_attention", {})
+    optics = template_cfg.get("optics", config.get("template_optics", config.get("optics", {})))
+    return AO2DConfig(
+        pixel_size=float(optics.get("pixel_size", 0.300)),
+        na=float(optics.get("na", 1.05)),
+        lambda_emission=float(optics.get("lambda_emission", optics.get("wavelength", 1.000))),
+        lambda_excitation=float(optics.get("lambda_excitation", 0.808)),
+        mode=str(optics.get("mode", "widefield")),
+        pinhole_au=float(optics.get("pinhole_au", 1.0)),
+        lightsheet_fwhm=float(optics.get("lightsheet_fwhm", 1.2)),
+        normalize=str(optics.get("normalize", "sum")),
+    )
+
+
+def _template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    template_cfg = config.get("template_attention", {})
+    image_size = template_cfg.get(
+        "image_size",
+        config.get("template_image_size", config.get("image_size", config.get("patch_size"))),
+    )
+    epsilon = template_cfg.get("epsilon_um", config.get("template_epsilon_um", 0.05))
+    max_amp = template_cfg.get("max_amp_um", config.get("template_max_amp_um"))
+    return dict(
+        template_image_size=None if image_size is None else tuple(int(v) for v in image_size),
+        template_optics_config=_make_template_optics_config(config),
+        template_epsilon_um=_as_tuple(epsilon) if isinstance(epsilon, (list, tuple)) else float(epsilon),
+        template_max_amp_um=(
+            None
+            if max_amp is None
+            else (_as_tuple(max_amp) if isinstance(max_amp, (list, tuple)) else float(max_amp))
+        ),
+        template_max_amp_base_um=float(template_cfg.get("max_amp_base_um", config.get("template_max_amp_base_um", 0.12))),
+        template_encoder_channels=int(template_cfg.get("encoder_channels", config.get("template_encoder_channels", 32))),
+        template_encoder_blocks=int(template_cfg.get("encoder_blocks", config.get("template_encoder_blocks", 3))),
+        template_encoder_kernel_size=int(
+            template_cfg.get("encoder_depthwise_kernel", config.get("template_encoder_kernel_size", 5))
+        ),
+        template_eta=float(template_cfg.get("eta", config.get("template_eta", 5.0))),
+        template_alpha=float(template_cfg.get("alpha", config.get("template_alpha", 10.0))),
+        template_tau_init=float(template_cfg.get("tau_init", config.get("template_tau_init", 0.3))),
+        template_confidence_init=float(
+            template_cfg.get("confidence_init", config.get("template_confidence_init", 1.4))
+        ),
+        template_fft_shift=bool(template_cfg.get("fft_shift", config.get("template_fft_shift", config.get("fft_shift", False)))),
+    )
 
 
 def make_model(config: dict[str, Any]) -> nn.Module:
@@ -128,6 +186,7 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             fft_shift=bool(config.get("fft_shift", False)),
             fft_phase_features=bool(config.get("fft_phase_features", False)),
             num_pixel_stack_layer=int(config.get("num_pixel_stack_layer", 0)),
+            **_template_kwargs(config),
         )
     if name in {"abenetv2", "abenetv2d", "abenet2dv2", "abe_fusion_v2", "abefusionnetv2d"}:
         return ABEFusionNetV2D(
@@ -152,6 +211,7 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             fft_phase_features=bool(config.get("fft_phase_features", False)),
             num_pixel_stack_layer=int(config.get("num_pixel_stack_layer", 0)),
             image_gate_obj_init=config.get("image_gate_obj_init", 0.3),
+            **_template_kwargs(config),
         )
     if name in {"abesplit", "abesplit2d", "abenet_split", "abenet_split2d", "abefusionnetsplit2d"}:
         return ABESplitNet2D(
@@ -187,5 +247,6 @@ def make_model(config: dict[str, Any]) -> nn.Module:
             fft_shift=bool(config.get("fft_shift", False)),
             fft_phase_features=bool(config.get("fft_phase_features", False)),
             num_pixel_stack_layer=int(config.get("num_pixel_stack_layer", 0)),
+            **_template_kwargs(config),
         )
     raise ValueError(f"Unknown model name: {name}")

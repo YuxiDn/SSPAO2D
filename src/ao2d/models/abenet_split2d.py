@@ -3,7 +3,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .abenet2d import BranchEncoder2D, LogFFTAmplitude2D, LogFFTAmplitudePhase2D, make_aberration_head_2d
+from ao2d.optics import AO2DConfig
+
+from .abenet2d import (
+    BranchEncoder2D,
+    LogFFTAmplitude2D,
+    LogFFTAmplitudePhase2D,
+    forward_aberration_head_2d,
+    make_aberration_head_2d,
+)
 from .blocks import output_activation
 from .scare2d import SobelGradient2D
 from .sfenet2d import ResUNet2D
@@ -40,6 +48,19 @@ class ABESplitNet2D(nn.Module):
         delta_phi_pupil_grid_size: int = 32,
         delta_phi_ridge: float = 1e-4,
         delta_phi_max_opd: float | None = 0.75,
+        template_image_size: tuple[int, int] | None = None,
+        template_optics_config: AO2DConfig | None = None,
+        template_epsilon_um: float | tuple[float, ...] = 0.05,
+        template_max_amp_um: float | tuple[float, ...] | None = None,
+        template_max_amp_base_um: float = 0.12,
+        template_encoder_channels: int = 32,
+        template_encoder_blocks: int = 3,
+        template_encoder_kernel_size: int = 5,
+        template_eta: float = 5.0,
+        template_alpha: float = 10.0,
+        template_tau_init: float = 0.3,
+        template_confidence_init: float = 1.4,
+        template_fft_shift: bool = False,
         fft: bool = True,
         fft_shift: bool = False,
         fft_phase_features: bool = False,
@@ -103,6 +124,19 @@ class ABESplitNet2D(nn.Module):
             delta_phi_pupil_grid_size=delta_phi_pupil_grid_size,
             delta_phi_ridge=delta_phi_ridge,
             delta_phi_max_opd=delta_phi_max_opd,
+            template_image_size=template_image_size,
+            template_optics_config=template_optics_config,
+            template_epsilon_um=template_epsilon_um,
+            template_max_amp_um=template_max_amp_um,
+            template_max_amp_base_um=template_max_amp_base_um,
+            template_encoder_channels=template_encoder_channels,
+            template_encoder_blocks=template_encoder_blocks,
+            template_encoder_kernel_size=template_encoder_kernel_size,
+            template_eta=template_eta,
+            template_alpha=template_alpha,
+            template_tau_init=template_tau_init,
+            template_confidence_init=template_confidence_init,
+            template_fft_shift=template_fft_shift,
         )
         self.activation = output_activation(final_activation)
 
@@ -119,5 +153,5 @@ class ABESplitNet2D(nn.Module):
         abe_fused = self.abe_fusion(torch.cat([abe_image, abe_gradient, abe_frequency], dim=1))
 
         obj = self.activation(self.object_head(obj_fused))
-        zernike = self.aberration_head(abe_fused)
+        zernike = forward_aberration_head_2d(self.aberration_head, abe_fused, x)
         return obj, zernike

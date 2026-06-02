@@ -1,0 +1,101 @@
+{
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_template_attention_synth_sameobj_imageonly_otfcos_b64_64ch_3blk_100ep",
+  "model": {
+    "name": "abesplit2d",
+    "in_channels": 1,
+    "out_channels": 1,
+    "final_activation": null,
+    "zernike_modes": 13,
+    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    "branch_channels": 24,
+    "fusion_channels": 64,
+    "branch_depth": 2,
+    "obj_base_channels": 32,
+    "obj_depth": 3,
+    "zernike_hidden": 128,
+    "zernike_depth": 2,
+    "zernike_reduction": 16,
+    "fft": true,
+    "fft_phase_features": true,
+    "aberration_head_type": "template_attention",
+    "template_attention": {
+      "epsilon_um": 0.05,
+      "max_amp_um": [
+        0.70, 0.68, 0.68, 0.53, 0.53, 0.58, 0.57,
+        0.41, 0.45, 0.43, 0.48, 0.46, 0.35
+      ],
+      "encoder_channels": 64,
+      "encoder_blocks": 3,
+      "encoder_depthwise_kernel": 5,
+      "eta": 5.0,
+      "alpha": 10.0,
+      "tau_init": 0.3,
+      "confidence_init": 1.4,
+      "max_amp_base_um": 0.12
+    }
+  },
+  "optics": {
+    "pixel_size": 0.300,
+    "na": 1.05,
+    "lambda_emission": 1.000,
+    "lambda_excitation": 0.808,
+    "mode": "widefield",
+    "zernike_indices": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  },
+  "data": {
+    "root": "/data/yxdeng993/data/2Dsim",
+    "input_scale_method": "percentile",
+    "input_scale_percentile": 99.9,
+    "patch_size": [224, 224],
+    "train": {
+      "image_dir": "abe",
+      "object_dir": "OBJ",
+      "zernike_dir": "Zernike",
+      "crop_mode": "random",
+      "samples_per_epoch": 2000
+    },
+    "val": {
+      "image_dir": "validation/abe",
+      "zernike_dir": "validation/Zernike",
+      "crop_mode": "center",
+      "samples_per_epoch": 400
+    }
+  },
+  "training": {
+    "epochs": 100,
+    "batch_size": 64,
+    "val_batch_size": 64,
+    "same_object_batches": true,
+    "synthetic_same_object_batches": true,
+    "synthetic_batches_per_epoch": 250,
+    "seed": 20260602,
+    "num_workers": 4,
+    "lr": 0.0001,
+    "min_lr": 0.000005,
+    "weight_decay": 0.00001,
+    "grad_clip": 1.0,
+    "auto_max_amp": false,
+    "max_amp_quantile": 0.95,
+    "max_amp_scale": 1.1,
+    "train_thresholds": true,
+    "use_object_reference_features": false,
+    "zernike_rms_min": 0.02,
+    "zernike_rms_max": 0.30,
+    "zernike_spectrum": "loworder",
+    "zernike_include_defocus": true
+  },
+  "loss": {
+    "coeff_l1_weight": 1.0,
+    "coeff_mse_weight": 0.1,
+    "presence_bce_weight": 0.05,
+    "otf_feature_cosine_weight": 0.2,
+    "otf_feature_l1_weight": 0.0,
+    "presence_threshold_um": 0.02
+  },
+  "visualization": {
+    "random_val_samples": 4,
+    "same_object_batch_samples": 8,
+    "interval": 1,
+    "seed": 20260602
+  }
+}

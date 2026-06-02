@@ -118,6 +118,42 @@ def phase_consistency_losses(
     return phase_loss, phase_grad_loss
 
 
+def zernike_opd_on_unit_pupil(
+    coefficients: torch.Tensor,
+    zernike_indices: tuple[int, ...],
+    grid_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    axis = torch.linspace(-1.0, 1.0, grid_size, device=coefficients.device, dtype=coefficients.dtype)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    rho = torch.hypot(xx, yy)
+    theta = torch.atan2(yy, xx)
+    pupil_mask = rho <= 1.0
+    wavefront = zernike_wavefront(zernike_indices, coefficients, rho, theta)
+    return wavefront * pupil_mask.to(dtype=wavefront.dtype), pupil_mask
+
+
+def cached_pupil_phase(model) -> torch.Tensor | None:
+    module = unwrap_ddp(model)
+    head = getattr(module, "zernike_head", None)
+    if head is None:
+        head = getattr(module, "aberration_head", None)
+    if head is None:
+        return None
+    return getattr(head, "last_phase", None)
+
+
+def pupil_phase_supervision_loss(
+    pred_phase: torch.Tensor | None,
+    target_coeff: torch.Tensor,
+    zernike_indices: tuple[int, ...],
+) -> torch.Tensor:
+    if pred_phase is None:
+        raise RuntimeError("phase_loss_weight > 0 requires an aberration head that exposes predicted pupil phase")
+    target_phase, pupil_mask = zernike_opd_on_unit_pupil(target_coeff, zernike_indices, pred_phase.shape[-1])
+    pupil_mask = pupil_mask.to(device=pred_phase.device)
+    return F.l1_loss(pred_phase[:, pupil_mask], target_phase[:, pupil_mask])
+
+
 def set_requires_grad(module, requires_grad: bool) -> None:
     if module is None:
         return
@@ -152,6 +188,18 @@ def make_optics_config(config: dict) -> AO2DConfig:
         pinhole_au=float(optics.get("pinhole_au", 1.0)),
         lightsheet_fwhm=float(optics.get("lightsheet_fwhm", 1.2)),
     )
+
+
+def prepare_model_config(config: dict) -> dict:
+    model_cfg = dict(config.get("model", {}))
+    head_type = str(model_cfg.get("aberration_head_type", "")).lower()
+    if head_type in {"template_attention", "otf_template_attention", "zernike_template_attention"}:
+        model_cfg.setdefault("template_image_size", config.get("data", {}).get("patch_size", [256, 256]))
+        model_cfg.setdefault("template_optics", config.get("optics", {}))
+        if "zernike_indices" not in model_cfg and "zernike_indices" in config.get("optics", {}):
+            model_cfg["zernike_indices"] = config["optics"]["zernike_indices"]
+            model_cfg["zernike_modes"] = len(model_cfg["zernike_indices"])
+    return model_cfg
 
 
 def make_self_dataset(config: dict, split: str, data_root: Path | None, augment_default: bool = False) -> AO2DSelfDataset:
@@ -400,6 +448,88 @@ def save_result_figure(
     plt.close(fig)
 
 
+def predict_pupil_phase(model, x: torch.Tensor) -> torch.Tensor | None:
+    head = getattr(model, "zernike_head", None)
+    if head is None:
+        head = getattr(model, "aberration_head", None)
+    if head is None or not hasattr(head, "forward_phase"):
+        return None
+
+    if hasattr(model, "zernike_fusion"):
+        image = model.image_branch(x)
+        gradient = model.gradient_branch(model.gradient_transform(x))
+        frequency = model.frequency_branch(model.frequency_transform(x))
+        fused = model.zernike_fusion(torch.cat([image, gradient, frequency], dim=1))
+    elif hasattr(model, "fusion"):
+        image = model.image_branch(x)
+        gradient = model.gradient_branch(model.gradient_transform(x))
+        frequency = model.frequency_branch(model.frequency_transform(x))
+        fused = model.fusion(torch.cat([image, gradient, frequency], dim=1))
+    elif hasattr(model, "abe_fusion"):
+        gradient = model.gradient_transform(x)
+        image = model.abe_image_branch(x)
+        gradient_features = model.abe_gradient_branch(gradient)
+        frequency = model.abe_frequency_branch(model.frequency_transform(x))
+        fused = model.abe_fusion(torch.cat([image, gradient_features, frequency], dim=1))
+    else:
+        return None
+    return head.forward_phase(fused)
+
+
+def pupil_mask_numpy(grid_size: int) -> np.ndarray:
+    axis = np.linspace(-1.0, 1.0, grid_size, dtype=np.float32)
+    yy, xx = np.meshgrid(axis, axis, indexing="ij")
+    return np.hypot(xx, yy) <= 1.0
+
+
+def save_pupil_phase_figure(
+    save_path: Path,
+    pred_phase: np.ndarray,
+    target_phase: np.ndarray | None = None,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pred_phase = np.asarray(pred_phase, dtype=np.float32)
+    mask = pupil_mask_numpy(pred_phase.shape[-1])
+    arrays = [pred_phase]
+    if target_phase is not None:
+        target_phase = np.asarray(target_phase, dtype=np.float32)
+        arrays.append(target_phase)
+        arrays.append(pred_phase - target_phase)
+    finite_values = [arr[mask][np.isfinite(arr[mask])] for arr in arrays]
+    finite_values = [values for values in finite_values if values.size > 0]
+    vmax = max((float(np.max(np.abs(values))) for values in finite_values), default=1.0)
+    vmax = max(vmax, 1e-6)
+
+    if target_phase is None:
+        fig, axes = plt.subplots(1, 1, figsize=(4.5, 4.0))
+        axes = [axes]
+        panels = [("Pred aberration", pred_phase)]
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.2))
+        panels = [
+            ("GT aberration", target_phase),
+            ("Pred aberration", pred_phase),
+            ("Pred - GT", pred_phase - target_phase),
+        ]
+
+    cmap = plt.get_cmap("turbo").copy()
+    cmap.set_bad("white")
+    last_im = None
+    for ax, (title, values) in zip(axes, panels, strict=True):
+        shown = np.ma.array(values, mask=~mask)
+        last_im = ax.imshow(shown, cmap=cmap, vmin=-vmax, vmax=vmax)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.colorbar(last_im, ax=axes, fraction=0.032, pad=0.03, label="OPD (um)")
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_validation_figures(
     model,
     dataset,
@@ -425,11 +555,13 @@ def save_validation_figures(
     eval_model = unwrap_ddp(model)
     was_training = eval_model.training
     eval_model.eval()
+    zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
     with torch.no_grad():
         for out_idx, dataset_idx in enumerate(indices, start=1):
             sample = dataset[dataset_idx]
             x = sample["input"][None].to(device)
             restored, pred_coeff = eval_model(x)
+            pred_phase = predict_pupil_phase(eval_model, x)
             measured = x[0, 0].detach().cpu().numpy()
             restored_np = restored[0, 0].detach().cpu().numpy()
             pred_coeff_np = pred_coeff[0].detach().cpu().numpy()
@@ -463,6 +595,26 @@ def save_validation_figures(
                 metrics,
                 display_limits,
             )
+            if pred_phase is not None:
+                phase_np = pred_phase[0].detach().cpu().numpy()
+                target_phase_np = None
+                if true_coeff is not None and true_coeff.size == pred_coeff_np.size:
+                    target_coeff = torch.as_tensor(true_coeff[None], device=device, dtype=pred_phase.dtype)
+                    target_phase, _ = zernike_opd_on_unit_pupil(target_coeff, zernike_indices, phase_np.shape[-1])
+                    target_phase_np = target_phase[0].detach().cpu().numpy()
+                    np.savez_compressed(
+                        output_dir / f"test{out_idx:04d}_pupil_phase_opd.npz",
+                        pred=phase_np,
+                        gt=target_phase_np,
+                        error=phase_np - target_phase_np,
+                    )
+                else:
+                    np.save(output_dir / f"test{out_idx:04d}_pupil_phase_opd.npy", phase_np)
+                save_pupil_phase_figure(
+                    output_dir / f"test{out_idx:04d}_pupil_phase_opd.png",
+                    phase_np,
+                    target_phase_np,
+                )
     eval_model.train(was_training)
 
 
@@ -615,7 +767,7 @@ def loss_weights(config: dict) -> dict[str, float]:
             ("cycle_aberration_weight", "aberration_coefficient"),
         ),
         "phase": float(training.get("phase_loss_weight", 0.0)),
-        "phase_grad": float(training.get("phase_grad_loss_weight", 0.0)),
+        "phase_grad": 0.0,
         "identity": float(training.get("identity_weight", training.get("identity_coefficient", 0.0))),
         "random_reaberration_object": training_float(
             training,
@@ -689,6 +841,8 @@ def train_iteration(
     restored_all, coeff_all = output
     restored_parts = torch.split(restored_all, split_sizes, dim=0)
     coeff_parts = torch.split(coeff_all, split_sizes, dim=0)
+    phase_all = cached_pupil_phase(model)
+    phase_parts = torch.split(phase_all, split_sizes, dim=0) if phase_all is not None else None
     restored = restored_parts[0]
     coeff = coeff_parts[0]
     estimated = forward_model(restored, coeff)
@@ -716,22 +870,20 @@ def train_iteration(
     if use_object_cycle and real_obj is not None and target_coeff is not None:
         restored_obj = restored_parts[part_idx]
         pred_coeff = coeff_parts[part_idx]
+        pred_phase = phase_parts[part_idx] if phase_parts is not None else None
         part_idx += 1
         loss_cycle_object = (
             weights["cycle_object"] * F.l1_loss(restored_obj, real_obj)
             + weights["cycle_object_feature"] * feature_l1_loss(restored_obj, real_obj)
         )
         loss_zernike_coeff_l1 = weights["zernike_coeff_l1"] * F.l1_loss(pred_coeff, target_coeff)
-        if weights["phase"] > 0 or weights["phase_grad"] > 0:
-            raw_phase_loss, raw_phase_grad_loss = phase_consistency_losses(
-                pred_coeff,
+        if weights["phase"] > 0:
+            raw_phase_loss = pupil_phase_supervision_loss(
+                pred_phase,
                 target_coeff,
                 zernike_indices,
-                tuple(config["data"].get("patch_size", [256, 256])),
-                config.get("optics", {}),
             )
             loss_phase = weights["phase"] * raw_phase_loss
-            loss_phase_grad = weights["phase_grad"] * raw_phase_grad_loss
         loss = loss + loss_cycle_object + loss_zernike_coeff_l1 + loss_phase + loss_phase_grad
 
     if use_identity and clean_obj is not None:
@@ -883,7 +1035,7 @@ def run_epoch(
         ("cycle_aberration_weight", "aberration_coefficient"),
     )
     phase_loss_weight = float(training.get("phase_loss_weight", 0.0))
-    phase_grad_loss_weight = float(training.get("phase_grad_loss_weight", 0.0))
+    phase_grad_loss_weight = 0.0
     identity_weight = float(config["training"].get("identity_weight", config["training"].get("identity_coefficient", 0.0)))
     adv_weight = adversarial_weight(config)
     zernike_indices = tuple(config.get("optics", {}).get("zernike_indices", list(range(3, 16))))
@@ -917,7 +1069,6 @@ def run_epoch(
                     or cycle_object_feature_weight > 0
                     or zernike_coeff_l1_weight > 0
                     or phase_loss_weight > 0
-                    or phase_grad_loss_weight > 0
                 ):
                     real_obj, object_iter = next_image_batch(object_iter, object_loader, device)
                     target_coeff = random_coefficients_batch(real_obj.shape[0], zernike_indices, device, config).to(dtype=real_obj.dtype)
@@ -928,16 +1079,13 @@ def run_epoch(
                         + cycle_object_feature_weight * feature_l1_loss(restored_obj, real_obj)
                     )
                     loss_zernike_coeff_l1 = zernike_coeff_l1_weight * F.l1_loss(pred_coeff, target_coeff)
-                    if phase_loss_weight > 0 or phase_grad_loss_weight > 0:
-                        raw_phase_loss, raw_phase_grad_loss = phase_consistency_losses(
-                            pred_coeff,
+                    if phase_loss_weight > 0:
+                        raw_phase_loss = pupil_phase_supervision_loss(
+                            cached_pupil_phase(model),
                             target_coeff,
                             zernike_indices,
-                            tuple(config["data"].get("patch_size", [256, 256])),
-                            config.get("optics", {}),
                         )
                         loss_phase = phase_loss_weight * raw_phase_loss
-                        loss_phase_grad = phase_grad_loss_weight * raw_phase_grad_loss
                     loss = loss + loss_cycle_object + loss_zernike_coeff_l1 + loss_phase + loss_phase_grad
 
                 if identity_loader is not None and identity_weight > 0:
@@ -1060,6 +1208,7 @@ def main() -> None:
     config = read_config(args.config)
     if args.accumulate_steps is not None:
         config.setdefault("training", {})["accumulate_steps"] = args.accumulate_steps
+    config["model"] = prepare_model_config(config)
     data_root = get_data_root(config, args.data_root)
     output_dir = Path(args.output or config.get("output_dir", "outputs/self_supervised"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1100,7 +1249,6 @@ def main() -> None:
         or training_float(training, "cycle_object_feature_weight", ("feature_pha_coefficient",)) > 0
         or training_float(training, "zernike_coeff_l1_weight", ("cycle_aberration_weight", "aberration_coefficient")) > 0
         or training_float(training, "phase_loss_weight") > 0
-        or training_float(training, "phase_grad_loss_weight") > 0
     )
     self_norm_kwargs = dict(
         normalization_mode=str(train_data_cfg.get("normalization_mode", config["data"].get("normalization_mode", "input_scale"))),

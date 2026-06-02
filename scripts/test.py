@@ -17,6 +17,18 @@ from ao2d.models.factory import make_model
 from ao2d.models.picnet2d import AberrationGenerator2D, OBJGenerator2D
 
 
+def prepare_model_config(config: dict) -> dict:
+    model_cfg = dict(config.get("model", {}))
+    head_type = str(model_cfg.get("aberration_head_type", "")).lower()
+    if head_type in {"template_attention", "otf_template_attention", "zernike_template_attention"}:
+        model_cfg.setdefault("template_image_size", config.get("data", {}).get("patch_size", [256, 256]))
+        model_cfg.setdefault("template_optics", config.get("optics", {}))
+        if "zernike_indices" not in model_cfg and "zernike_indices" in config.get("optics", {}):
+            model_cfg["zernike_indices"] = config["optics"]["zernike_indices"]
+            model_cfg["zernike_modes"] = len(model_cfg["zernike_indices"])
+    return model_cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run 2-D AO restoration inference.")
     parser.add_argument("--checkpoint", required=True)
@@ -26,6 +38,7 @@ def main() -> None:
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     config = ckpt["config"]
+    config["model"] = prepare_model_config(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if "object_generator" in ckpt and "aberration_generator" in ckpt:
         model_cfg = config.get("model", {})

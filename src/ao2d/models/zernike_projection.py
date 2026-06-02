@@ -233,6 +233,7 @@ class PupilPhaseZernikeProjectionHead2D(nn.Module):
             ridge=ridge,
         )
         self.max_phase_opd = max_phase_opd
+        self.last_phase: torch.Tensor | None = None
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden, 1),
             nn.BatchNorm2d(hidden),
@@ -264,6 +265,7 @@ class PupilPhaseZernikeProjectionHead2D(nn.Module):
 
     def forward_delta(self, x: torch.Tensor) -> torch.Tensor:
         phase = self.forward_phase(x)
+        self.last_phase = phase
         return self.projection.phase_to_difference(phase)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

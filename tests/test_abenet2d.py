@@ -4,6 +4,7 @@ from ao2d.models import (
     ABESplitNet2D,
     ABEFusionNet2D,
     DeltaPhiZernikeProjectionHead2D,
+    OTFTemplateAttentionHead2D,
     PupilPhaseZernikeProjectionHead2D,
 )
 from ao2d.models.factory import make_model
@@ -213,3 +214,57 @@ def test_factory_builds_abesplit2d_with_fft_phase_and_pupil_phase_projection_hea
 
     assert obj.shape == x.shape
     assert zernike.shape == (2, 5)
+
+
+def test_factory_builds_abesplit2d_with_template_attention_head():
+    model = make_model(
+        {
+            "name": "abesplit2d",
+            "in_channels": 1,
+            "out_channels": 1,
+            "zernike_modes": 5,
+            "zernike_indices": [3, 4, 5, 6, 7],
+            "branch_channels": 4,
+            "fusion_channels": 12,
+            "branch_depth": 1,
+            "obj_base_channels": 8,
+            "obj_depth": 1,
+            "zernike_hidden": 16,
+            "zernike_depth": 1,
+            "zernike_reduction": 4,
+            "aberration_head_type": "template_attention",
+            "template_image_size": [24, 24],
+            "template_optics": {
+                "pixel_size": 0.3,
+                "na": 1.05,
+                "lambda_emission": 1.0,
+                "lambda_excitation": 0.808,
+                "mode": "widefield",
+            },
+            "template_attention": {
+                "epsilon_um": 0.05,
+                "encoder_channels": 8,
+                "encoder_blocks": 1,
+                "eta": 5.0,
+                "alpha": 10.0,
+                "tau_init": 0.3,
+                "confidence_init": 1.4,
+            },
+            "fft": True,
+            "fft_phase_features": True,
+            "final_activation": "none",
+        }
+    )
+    x = torch.rand(2, 1, 24, 24)
+
+    obj, zernike = model(x)
+    head = model.aberration_head
+
+    assert isinstance(head, OTFTemplateAttentionHead2D)
+    assert obj.shape == x.shape
+    assert zernike.shape == (2, 5)
+    assert torch.isfinite(zernike).all()
+    assert head.template_bank.templates.shape == (5, 2, 3, 24, 24)
+    assert head.last_confidence is not None
+    assert head.last_confidence.shape == (2, 5)
+    assert torch.all((head.last_confidence >= 0) & (head.last_confidence <= 1))
