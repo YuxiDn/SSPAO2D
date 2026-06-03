@@ -257,17 +257,87 @@ def estimate_max_amp(dataset: TemplateAttentionPretrainDataset, quantile: float,
     return torch.from_numpy((np.quantile(np.abs(stacked), quantile, axis=0) * scale).astype(np.float32))
 
 
-def coefficient_metrics(pred: torch.Tensor, target: torch.Tensor, presence: torch.Tensor, threshold: float) -> dict[str, float]:
-    error = pred - target
+def _template_signed_mask(head, device) -> torch.Tensor | None:
+    mask = getattr(head, "template_signed_mode_mask", None)
+    if mask is None:
+        return None
+    return mask.to(device=device, dtype=torch.bool)
+
+
+def _masked_loss(loss_fn, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if not mask.any():
+        return pred.new_zeros(())
+    return loss_fn(pred[:, mask], target[:, mask])
+
+
+def template_coefficient_loss(
+    head,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    coeff_l1_weight: float,
+    coeff_mse_weight: float,
+    magnitude_l1_weight: float,
+) -> torch.Tensor:
+    signed_mask = _template_signed_mask(head, pred.device)
+    if signed_mask is None or bool(signed_mask.all()):
+        loss = coeff_l1_weight * F.l1_loss(pred, target)
+        if coeff_mse_weight > 0:
+            loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
+        return loss
+
+    loss = pred.new_zeros(())
+    loss = loss + coeff_l1_weight * _masked_loss(F.l1_loss, pred, target, signed_mask)
+    if coeff_mse_weight > 0:
+        loss = loss + coeff_mse_weight * _masked_loss(F.mse_loss, pred, target, signed_mask)
+
+    presence_only_mask = ~signed_mask
+    if magnitude_l1_weight > 0 and bool(presence_only_mask.any()):
+        loss = loss + magnitude_l1_weight * F.l1_loss(
+            pred[:, presence_only_mask].abs(),
+            target[:, presence_only_mask].abs(),
+        )
+    return loss
+
+
+def coefficient_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    presence: torch.Tensor,
+    threshold: float,
+    signed_mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    if signed_mask is None or bool(signed_mask.all()):
+        error = pred - target
+        signed_error = error
+        magnitude_error = pred.new_empty((0,))
+    else:
+        signed_mask = signed_mask.to(device=pred.device, dtype=torch.bool)
+        error = pred - target
+        hybrid_pred = pred.clone()
+        presence_only_mask = ~signed_mask
+        hybrid_pred[:, presence_only_mask] = hybrid_pred[:, presence_only_mask].abs()
+        hybrid_target = target.clone()
+        hybrid_target[:, presence_only_mask] = hybrid_target[:, presence_only_mask].abs()
+        error = hybrid_pred - hybrid_target
+        signed_error = pred[:, signed_mask] - target[:, signed_mask] if signed_mask.any() else pred.new_empty((0,))
+        magnitude_error = (
+            pred[:, presence_only_mask].abs() - target[:, presence_only_mask].abs()
+            if presence_only_mask.any()
+            else pred.new_empty((0,))
+        )
     mae_per_mode = error.abs().mean(dim=0)
     active = target.abs() > threshold
-    if active.any():
-        sign_acc = ((torch.sign(pred[active]) == torch.sign(target[active])).float().mean()).item()
+    if signed_mask is not None:
+        active_for_sign = active & signed_mask[None, :]
+    else:
+        active_for_sign = active
+    if active_for_sign.any():
+        sign_acc = ((torch.sign(pred[active_for_sign]) == torch.sign(target[active_for_sign])).float().mean()).item()
     else:
         sign_acc = float("nan")
     pred_active = presence > 0.5
     presence_acc = (pred_active == active).float().mean().item()
-    return {
+    metrics = {
         "mae": float(error.abs().mean().detach()),
         "rmse": float(torch.sqrt(error.square().mean()).detach()),
         "max_mode_mae": float(mae_per_mode.max().detach()),
@@ -275,6 +345,11 @@ def coefficient_metrics(pred: torch.Tensor, target: torch.Tensor, presence: torc
         "presence_acc": float(presence_acc),
         "presence_mean": float(presence.mean().detach()),
     }
+    if signed_error.numel() > 0:
+        metrics["signed_mae"] = float(signed_error.abs().mean().detach())
+    if magnitude_error.numel() > 0:
+        metrics["magnitude_mae"] = float(magnitude_error.abs().mean().detach())
+    return metrics
 
 
 def normalize_otf_feature_target(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -358,6 +433,7 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
     weights = config.get("loss", {})
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
+    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", coeff_l1_weight))
     presence_weight = float(weights.get("presence_bce_weight", 0.0))
     presence_threshold = float(weights.get("presence_threshold_um", 0.02))
     totals: dict[str, float] = {}
@@ -368,9 +444,14 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
             image = batch["input"].to(device, non_blocking=True)
             target = batch["coeff"].to(device, non_blocking=True)
             pred, _, presence, _ = head._template_coefficients(image)
-            loss = coeff_l1_weight * F.l1_loss(pred, target)
-            if coeff_mse_weight > 0:
-                loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
+            loss = template_coefficient_loss(
+                head,
+                pred,
+                target,
+                coeff_l1_weight,
+                coeff_mse_weight,
+                magnitude_l1_weight,
+            )
             if presence_weight > 0:
                 presence_target = (target.abs() > presence_threshold).to(dtype=presence.dtype)
                 loss = loss + presence_weight * F.binary_cross_entropy(presence, presence_target)
@@ -379,7 +460,13 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_([p for p in head.parameters() if p.requires_grad], float(config.get("grad_clip", 1.0)))
                 optimizer.step()
-            metrics = coefficient_metrics(pred.detach(), target.detach(), presence.detach(), presence_threshold)
+            metrics = coefficient_metrics(
+                pred.detach(),
+                target.detach(),
+                presence.detach(),
+                presence_threshold,
+                _template_signed_mask(head, pred.device),
+            )
             metrics["loss"] = float(loss.detach())
             metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())
@@ -405,6 +492,7 @@ def run_synthetic_same_object_epoch(
     weights = config.get("loss", {})
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
+    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", coeff_l1_weight))
     presence_weight = float(weights.get("presence_bce_weight", 0.0))
     otf_feature_weight = float(weights.get("otf_feature_l1_weight", 0.0))
     otf_feature_cosine_weight = float(weights.get("otf_feature_cosine_weight", 0.0))
@@ -434,9 +522,14 @@ def run_synthetic_same_object_epoch(
                 reference_image=reference,
                 return_features=True,
             )
-            loss = coeff_l1_weight * F.l1_loss(pred, target)
-            if coeff_mse_weight > 0:
-                loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
+            loss = template_coefficient_loss(
+                head,
+                pred,
+                target,
+                coeff_l1_weight,
+                coeff_mse_weight,
+                magnitude_l1_weight,
+            )
             if presence_weight > 0:
                 presence_target = (target.abs() > presence_threshold).to(dtype=presence.dtype)
                 loss = loss + presence_weight * F.binary_cross_entropy(presence, presence_target)
@@ -465,7 +558,13 @@ def run_synthetic_same_object_epoch(
                     float(config.get("grad_clip", 1.0)),
                 )
                 optimizer.step()
-            metrics = coefficient_metrics(pred.detach(), target.detach(), presence.detach(), presence_threshold)
+            metrics = coefficient_metrics(
+                pred.detach(),
+                target.detach(),
+                presence.detach(),
+                presence_threshold,
+                _template_signed_mask(head, pred.device),
+            )
             metrics["loss"] = float(loss.detach())
             metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())

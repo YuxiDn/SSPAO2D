@@ -35,6 +35,19 @@ def _l2_normalize_template(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x / norm[..., None, None]
 
 
+def _mode_mask_from_indices(
+    zernike_indices: tuple[int, ...],
+    selected_indices: Iterable[int] | None,
+) -> torch.Tensor:
+    if selected_indices is None:
+        return torch.ones(len(zernike_indices), dtype=torch.bool)
+    selected = {int(v) for v in selected_indices}
+    unknown = selected.difference(zernike_indices)
+    if unknown:
+        raise ValueError(f"signed_zernike_indices contains modes not in zernike_indices: {sorted(unknown)}")
+    return torch.tensor([idx in selected for idx in zernike_indices], dtype=torch.bool)
+
+
 def _centered_fft2(image: torch.Tensor, fft_shift: bool, subtract_mean: bool = True) -> torch.Tensor:
     x = image.float()
     if subtract_mean:
@@ -314,6 +327,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
         eps: float = 1e-8,
         use_amplitude_head: bool = True,
         response_scale_init: float = 50.0,
+        signed_zernike_indices: Iterable[int] | None = None,
     ) -> None:
         super().__init__()
         indices = tuple(int(v) for v in zernike_indices)
@@ -374,6 +388,11 @@ class OTFTemplateAttentionHead2D(nn.Module):
             if max_amp.numel() != len(indices):
                 raise ValueError("max_amp_um must be a scalar or have one value per Zernike mode")
         self.register_buffer("max_amp_um", max_amp.to(torch.float32), persistent=True)
+        self.register_buffer(
+            "template_signed_mode_mask",
+            _mode_mask_from_indices(indices, signed_zernike_indices),
+            persistent=True,
+        )
 
         self.raw_eta = nn.Parameter(torch.tensor(_softplus_inverse(eta), dtype=torch.float32))
         self.raw_alpha = nn.Parameter(torch.tensor(_softplus_inverse(alpha), dtype=torch.float32))
@@ -403,6 +422,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
         self.last_confidence: torch.Tensor | None = None
         self.last_a_base: torch.Tensor | None = None
         self.last_a_template: torch.Tensor | None = None
+        self.last_attention_magnitude: torch.Tensor | None = None
 
     def _input_features(self, image: torch.Tensor, reference_image: torch.Tensor | None = None) -> torch.Tensor:
         spectrum = _centered_fft2(image, self.fft_shift, subtract_mean=self.input_center)
@@ -475,7 +495,25 @@ class OTFTemplateAttentionHead2D(nn.Module):
         sign = torch.tanh(response_scale[None, :] * derivative_score)
         presence = torch.sigmoid(alpha * (best_score - self.tau.to(device=image.device, dtype=best_score.dtype)))
         max_amp = self.max_amp_um.to(device=image.device, dtype=presence.dtype)
-        a_template = max_amp[None, :] * sign
+        amplitude_inputs = torch.stack(
+            [
+                scores_pos,
+                scores_neg,
+                best_score,
+                torch.abs(signed_score),
+                presence,
+            ],
+            dim=-1,
+        )
+        if self.use_amplitude_head:
+            amplitude_gate = torch.sigmoid(self.amplitude_head(amplitude_inputs).squeeze(-1))
+        else:
+            amplitude_gate = torch.ones_like(presence)
+        magnitude = max_amp[None, :] * presence * amplitude_gate
+        signed_mask = self.template_signed_mode_mask.to(device=image.device, dtype=torch.bool)
+        a_signed = magnitude * sign
+        a_template = torch.where(signed_mask[None, :], a_signed, magnitude)
+        self.last_attention_magnitude = magnitude.detach()
         return a_template, scores, presence, sign
 
     def _template_coefficients(
@@ -498,6 +536,8 @@ class OTFTemplateAttentionHead2D(nn.Module):
         scores_neg = scores[..., 1]
         best_score = torch.maximum(scores_pos, scores_neg)
         signed_score = scores_pos - scores_neg
+        signed_mask = self.template_signed_mode_mask.to(device=image.device, dtype=torch.bool)
+        template_proposal = torch.where(signed_mask[None, :], a_template, presence * a_base)
         confidence_inputs = torch.stack(
             [
                 scores_pos,
@@ -505,19 +545,19 @@ class OTFTemplateAttentionHead2D(nn.Module):
                 best_score,
                 torch.abs(signed_score),
                 torch.abs(a_template),
-                torch.abs(a_template - a_base),
+                torch.abs(template_proposal - a_base),
             ],
             dim=-1,
         )
         confidence = torch.sigmoid(self.confidence_head(confidence_inputs).squeeze(-1))
-        a_final = confidence * a_template + (1.0 - confidence) * a_base
+        a_final = confidence * template_proposal + (1.0 - confidence) * a_base
 
         self.last_scores = scores.detach()
         self.last_presence = presence.detach()
         self.last_sign = sign.detach()
         self.last_confidence = confidence.detach()
         self.last_a_base = a_base.detach()
-        self.last_a_template = a_template.detach()
+        self.last_a_template = template_proposal.detach()
         return a_final
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:

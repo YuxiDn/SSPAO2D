@@ -122,6 +122,7 @@ def make_aberration_head_2d(
     template_input_phase_mask_percentile: float = 72.0,
     template_input_feature_channels: int = 5,
     template_otf_mtf_threshold: float = 0.03,
+    template_signed_zernike_indices: tuple[int, ...] | None = None,
 ) -> nn.Module:
     head_type = str(head_type).lower()
     indices = tuple(range(3, 3 + zernike_modes)) if zernike_indices is None else tuple(int(v) for v in zernike_indices)
@@ -184,6 +185,7 @@ def make_aberration_head_2d(
             input_phase_mask_percentile=template_input_phase_mask_percentile,
             input_feature_channels=template_input_feature_channels,
             otf_mtf_threshold=template_otf_mtf_threshold,
+            signed_zernike_indices=template_signed_zernike_indices,
         )
     raise ValueError(f"Unsupported aberration_head_type: {head_type}")
 
@@ -240,6 +242,7 @@ class ABEFusionNet2D(nn.Module):
         template_input_phase_mask_percentile: float = 72.0,
         template_input_feature_channels: int = 5,
         template_otf_mtf_threshold: float = 0.03,
+        template_signed_zernike_indices: tuple[int, ...] | None = None,
         fft: bool = True,
         fft_shift: bool = False,
         fft_phase_features: bool = False,
@@ -304,6 +307,7 @@ class ABEFusionNet2D(nn.Module):
             template_input_phase_mask_percentile=template_input_phase_mask_percentile,
             template_input_feature_channels=template_input_feature_channels,
             template_otf_mtf_threshold=template_otf_mtf_threshold,
+            template_signed_zernike_indices=template_signed_zernike_indices,
         )
         self.activation = output_activation(final_activation)
 

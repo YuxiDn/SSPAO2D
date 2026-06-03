@@ -249,6 +249,7 @@ def test_factory_builds_abesplit2d_with_template_attention_head():
                 "alpha": 10.0,
                 "tau_init": 0.3,
                 "confidence_init": 1.4,
+                "signed_zernike_indices": [6, 7],
             },
             "fft": True,
             "fft_phase_features": True,
@@ -265,6 +266,7 @@ def test_factory_builds_abesplit2d_with_template_attention_head():
     assert zernike.shape == (2, 5)
     assert torch.isfinite(zernike).all()
     assert head.template_bank.templates.shape == (5, 2, 3, 24, 24)
+    assert head.template_signed_mode_mask.tolist() == [False, False, False, True, True]
     assert head.last_confidence is not None
     assert head.last_confidence.shape == (2, 5)
     assert torch.all((head.last_confidence >= 0) & (head.last_confidence <= 1))

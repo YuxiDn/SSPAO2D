@@ -51,6 +51,10 @@ def _template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     )
     epsilon = template_cfg.get("epsilon_um", config.get("template_epsilon_um", 0.05))
     max_amp = template_cfg.get("max_amp_um", config.get("template_max_amp_um"))
+    signed_indices = template_cfg.get(
+        "signed_zernike_indices",
+        config.get("template_signed_zernike_indices", None),
+    )
     return dict(
         template_image_size=None if image_size is None else tuple(int(v) for v in image_size),
         template_optics_config=_make_template_optics_config(config),
@@ -84,6 +88,7 @@ def _template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         template_otf_mtf_threshold=float(
             template_cfg.get("otf_mtf_threshold", config.get("template_otf_mtf_threshold", 0.03))
         ),
+        template_signed_zernike_indices=None if signed_indices is None else tuple(int(v) for v in signed_indices),
     )
 
 

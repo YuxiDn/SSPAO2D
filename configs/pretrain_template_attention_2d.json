@@ -37,7 +37,8 @@
       "alpha": 10.0,
       "tau_init": 0.3,
       "confidence_init": 1.4,
-      "max_amp_base_um": 0.12
+      "max_amp_base_um": 0.12,
+      "signed_zernike_indices": [6, 7, 8, 9, 15]
     }
   },
   "optics": {
@@ -93,6 +94,7 @@
   "loss": {
     "coeff_l1_weight": 1.0,
     "coeff_mse_weight": 0.1,
+    "magnitude_l1_weight": 1.0,
     "presence_bce_weight": 0.05,
     "otf_feature_cosine_weight": 0.2,
     "otf_feature_l1_weight": 0.0,
