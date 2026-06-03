@@ -429,7 +429,7 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
     weights = config.get("loss", {})
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
-    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", coeff_l1_weight))
+    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", 0.0))
     presence_weight = float(weights.get("presence_bce_weight", 0.0))
     presence_threshold = float(weights.get("presence_threshold_um", 0.02))
     totals: dict[str, float] = {}
@@ -487,7 +487,7 @@ def run_synthetic_same_object_epoch(
     weights = config.get("loss", {})
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
-    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", coeff_l1_weight))
+    magnitude_l1_weight = float(weights.get("magnitude_l1_weight", 0.0))
     presence_weight = float(weights.get("presence_bce_weight", 0.0))
     otf_feature_weight = float(weights.get("otf_feature_l1_weight", 0.0))
     otf_feature_cosine_weight = float(weights.get("otf_feature_cosine_weight", 0.0))
@@ -895,7 +895,8 @@ def main() -> None:
     )
 
     metrics_path = output_dir / "metrics.csv"
-    best_mae = float("inf")
+    best_metric_name = str(config["training"].get("best_metric", "signed_mae"))
+    best_metric = float("inf")
     with metrics_path.open("w", newline="") as f:
         writer = None
         for epoch in range(1, int(config["training"].get("epochs", 50)) + 1):
@@ -928,6 +929,7 @@ def main() -> None:
             print(
                 f"epoch={epoch:03d} "
                 f"train_mae={train_metrics['mae']:.5f} val_mae={val_metrics['mae']:.5f} "
+                f"val_signed_mae={val_metrics.get('signed_mae', float('nan')):.5f} "
                 f"val_sign={val_metrics['sign_acc']:.3f} val_presence={val_metrics['presence_acc']:.3f}"
             )
             save_validation_coefficient_figures(head, val_set, output_dir, device, epoch, config)
@@ -941,8 +943,9 @@ def main() -> None:
                 "val_metrics": val_metrics,
             }
             torch.save(checkpoint, output_dir / "last.pt")
-            if val_metrics["mae"] < best_mae:
-                best_mae = val_metrics["mae"]
+            current_metric = float(val_metrics.get(best_metric_name, val_metrics["mae"]))
+            if current_metric < best_metric:
+                best_metric = current_metric
                 torch.save(checkpoint, output_dir / "best.pt")
 
 

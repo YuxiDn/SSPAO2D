@@ -197,3 +197,5 @@ objects_per_synthetic_batch = 8
 ```
 
 每个优化 step 从 clean OBJ dataset 中取 8 个 OBJ，然后给每个 OBJ 分配约 `128 / 8 = 16` 组随机 Zernike 系数，再通过 forward model 生成 128 张带像差图像。这样保留了同一 OBJ 多像差的可控监督，同时 batch 内也包含多个 OBJ，更接近实际训练分布。
+
+对于不在 `signed_zernike_indices` 里的 mode，template attention pretrain 只使用 presence BCE，不使用 `|prediction|` 对齐 `|coefficient|` 的 magnitude L1。原因是这些 mode 在最终模型中只用 `presence * base_head` 门控主干回归分支；如果在 pretrain 中强行让 `max_amp * presence` 拟合 `|coefficient|`，会把 presence 拉到 `|coefficient| / max_amp` 附近，和“active mode 的 presence 应接近 1”的 BCE 目标冲突。
