@@ -247,7 +247,7 @@ class PupilPhaseZernikeProjectionHead2D(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(hidden, pupil_grid_size * pupil_grid_size),
         )
-        nn.init.zeros_(self.phase_head[-1].weight)
+        nn.init.xavier_uniform_(self.phase_head[-1].weight, gain=1e-3)
         nn.init.zeros_(self.phase_head[-1].bias)
 
     def forward_phase(self, x: torch.Tensor) -> torch.Tensor:

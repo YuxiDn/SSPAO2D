@@ -15,6 +15,7 @@
     "zernike_hidden": 128,
     "zernike_depth": 2,
     "zernike_reduction": 16,
+    "delta_phi_max_opd": null,
     "fft": true,
     "fft_phase_features": true,
     "aberration_head_type": "attention_modulated_pupil_phase",

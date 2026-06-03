@@ -624,10 +624,10 @@ class AttentionModulatedPupilPhaseHead2D(nn.Module):
             modulation = 1.0 + modulation_lambda * mode_strength.to(dtype=a_base.dtype)
         a_final = modulation * a_base
 
-        self.last_a_base = a_base.detach()
-        self.last_mode_strength = mode_strength.detach()
-        self.last_modulation = modulation.detach()
-        self.last_scores = scores.detach()
+        self.last_a_base = a_base
+        self.last_mode_strength = mode_strength
+        self.last_modulation = modulation
+        self.last_scores = scores
         self.last_phase = self.phase_head.last_phase
         return a_final
 
