@@ -957,6 +957,164 @@ def save_validation_coefficient_figures(
     head.train(was_training)
 
 
+def save_attention_modulated_validation_figures(
+    model,
+    dataset: TemplateAttentionPretrainDataset,
+    output_dir: Path,
+    device,
+    epoch: int,
+    config: dict,
+    use_amp: bool = False,
+) -> None:
+    vis_cfg = config.get("visualization", {})
+    count = int(vis_cfg.get("random_val_samples", 4))
+    interval = int(vis_cfg.get("interval", 1))
+    if count <= 0 or interval <= 0 or epoch % interval != 0:
+        return
+
+    head = get_template_head(model)
+    zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
+    x_axis = np.arange(len(zernike_indices))
+    save_dir = output_dir / "validation_attention_modulated"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(int(vis_cfg.get("seed", 20260602)) + 200_000 + epoch)
+    indices = rng.choice(len(dataset), size=min(count, len(dataset)), replace=False)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for out_idx, dataset_idx in enumerate(indices, start=1):
+            sample = dataset[int(dataset_idx)]
+            image = sample["input"][None].to(device)
+            target = sample["coeff"][None].to(device)
+            with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
+                final = predict_coefficients_only(model, head, image)
+
+            base = getattr(head, "last_a_base", None)
+            strength = getattr(head, "last_mode_strength", None)
+            modulation = getattr(head, "last_modulation", None)
+            phase = getattr(head, "last_phase", None)
+            scores = getattr(head, "last_scores", None)
+            if base is None or strength is None or modulation is None or phase is None:
+                continue
+
+            target_phase, pupil_mask = target_pupil_opd(target, zernike_indices, phase.shape[-1])
+            pupil_mask_np = pupil_mask.detach().cpu().numpy().astype(bool)
+            input_np = image[0, 0].detach().float().cpu().numpy()
+            target_np = target[0].detach().float().cpu().numpy()
+            base_np = base[0].detach().float().cpu().numpy()
+            final_np = final[0].detach().float().cpu().numpy()
+            strength_np = strength[0].detach().float().cpu().numpy()
+            modulation_np = modulation[0].detach().float().cpu().numpy()
+            pred_phase_np = phase[0].detach().float().cpu().numpy()
+            target_phase_np = target_phase[0].detach().float().cpu().numpy()
+            phase_error_np = pred_phase_np - target_phase_np
+            if scores is not None:
+                scores_np = scores[0].detach().float().cpu().numpy()
+            else:
+                scores_np = np.zeros((len(zernike_indices), 2), dtype=np.float32)
+
+            base_err = np.abs(base_np - target_np)
+            final_err = np.abs(final_np - target_np)
+            mode_gain = base_err - final_err
+            global_gain = float(np.mean(base_err) - np.mean(final_err))
+            phase_vmax = float(
+                max(
+                    np.max(np.abs(pred_phase_np[pupil_mask_np])),
+                    np.max(np.abs(target_phase_np[pupil_mask_np])),
+                    1e-6,
+                )
+            )
+            error_vmax = float(max(np.max(np.abs(phase_error_np[pupil_mask_np])), 1e-6))
+
+            fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+            axes[0, 0].imshow(input_np, cmap="gray")
+            axes[0, 0].set_title("Input")
+            axes[0, 0].axis("off")
+            im = axes[0, 1].imshow(pred_phase_np, cmap="turbo", vmin=-phase_vmax, vmax=phase_vmax)
+            axes[0, 1].contour(pupil_mask_np, levels=[0.5], colors="white", linewidths=0.5)
+            axes[0, 1].set_title("Predicted pupil phase")
+            axes[0, 1].axis("off")
+            fig.colorbar(im, ax=axes[0, 1], fraction=0.046, pad=0.04)
+            im = axes[0, 2].imshow(target_phase_np, cmap="turbo", vmin=-phase_vmax, vmax=phase_vmax)
+            axes[0, 2].contour(pupil_mask_np, levels=[0.5], colors="white", linewidths=0.5)
+            axes[0, 2].set_title("Target pupil phase")
+            axes[0, 2].axis("off")
+            fig.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+            width = 0.25
+            axes[1, 0].bar(x_axis - width, target_np, width=width, label="target", color="#374151")
+            axes[1, 0].bar(x_axis, base_np, width=width, label="base", color="#2563eb")
+            axes[1, 0].bar(x_axis + width, final_np, width=width, label="final", color="#dc2626")
+            axes[1, 0].axhline(0.0, color="black", linewidth=0.8)
+            axes[1, 0].set_title(
+                f"Coefficients: base MAE={np.mean(base_err):.4f}, final MAE={np.mean(final_err):.4f}"
+            )
+            axes[1, 0].set_ylabel("coefficient (um)")
+            axes[1, 0].legend(fontsize=8)
+
+            axes[1, 1].bar(x_axis, mode_gain, color=np.where(mode_gain >= 0.0, "#059669", "#dc2626"))
+            axes[1, 1].axhline(0.0, color="black", linewidth=0.8)
+            axes[1, 1].set_title(f"Mode gain: |base-target|-|final-target|, mean={global_gain:.5f}")
+            axes[1, 1].set_ylabel("MAE gain (um)")
+
+            axes[1, 2].plot(x_axis, strength_np, marker="o", label="attention strength", color="#2563eb")
+            axes[1, 2].plot(x_axis, modulation_np, marker="s", label="modulation r_k", color="#dc2626")
+            axes[1, 2].axhline(1.0, color="black", linewidth=0.8, linestyle="--")
+            axes[1, 2].set_title("Attention and modulation")
+            axes[1, 2].legend(fontsize=8)
+
+            im = axes[2, 0].imshow(phase_error_np, cmap="coolwarm", vmin=-error_vmax, vmax=error_vmax)
+            axes[2, 0].contour(pupil_mask_np, levels=[0.5], colors="black", linewidths=0.5)
+            axes[2, 0].set_title("Phase error")
+            axes[2, 0].axis("off")
+            fig.colorbar(im, ax=axes[2, 0], fraction=0.046, pad=0.04)
+
+            axes[2, 1].plot(x_axis, scores_np[:, 0], marker="o", label="-eps score", color="#7c3aed")
+            axes[2, 1].plot(x_axis, scores_np[:, 1], marker="o", label="+eps score", color="#ea580c")
+            axes[2, 1].set_title("Template scores")
+            axes[2, 1].legend(fontsize=8)
+
+            axes[2, 2].scatter(strength_np, np.abs(target_np), c=x_axis, cmap="viridis", s=50)
+            for i, mode in enumerate(zernike_indices):
+                axes[2, 2].annotate(str(mode), (strength_np[i], abs(target_np[i])), fontsize=8)
+            axes[2, 2].set_xlabel("attention strength")
+            axes[2, 2].set_ylabel("|target coefficient|")
+            axes[2, 2].set_title("Strength vs target amplitude")
+
+            for ax in axes[1:].flat:
+                if ax.has_data():
+                    ax.set_xticks(x_axis)
+                    ax.set_xticklabels([str(v) for v in zernike_indices], rotation=45)
+                    ax.grid(axis="y", linestyle="--", alpha=0.3)
+            fig.suptitle(
+                f"Epoch {epoch} sample {out_idx}: {Path(str(sample['input_path'])).name}",
+                y=0.995,
+            )
+            fig.tight_layout()
+            fig.savefig(save_dir / f"epoch_{epoch:04d}_sample_{out_idx:02d}.png", dpi=180)
+            plt.close(fig)
+
+            np.savez_compressed(
+                save_dir / f"epoch_{epoch:04d}_sample_{out_idx:02d}.npz",
+                zernike_indices=np.asarray(zernike_indices),
+                target=target_np,
+                base=base_np,
+                final=final_np,
+                mode_gain=mode_gain,
+                strength=strength_np,
+                modulation=modulation_np,
+                scores=scores_np,
+                pred_phase=pred_phase_np,
+                target_phase=target_phase_np,
+                phase_error=phase_error_np,
+                pupil_mask=pupil_mask_np,
+                input_path=str(sample["input_path"]),
+                coeff_path=str(sample["coeff_path"]),
+            )
+    model.train(was_training)
+
+
 def save_same_object_batch_figure(
     head,
     dataset: TemplateAttentionPretrainDataset,
@@ -1274,7 +1432,9 @@ def main() -> None:
                 f"val_strength_kl={val_metrics.get('strength_kl', float('nan')):.4f} "
                 f"val_presence={val_metrics.get('presence_acc', float('nan')):.3f}"
             )
-            if not attention_modulated:
+            if attention_modulated:
+                save_attention_modulated_validation_figures(model, val_set, output_dir, device, epoch, config, use_amp)
+            else:
                 save_validation_coefficient_figures(head, val_set, output_dir, device, epoch, config)
                 save_same_object_batch_figure(head, val_set, output_dir, device, epoch, config)
             checkpoint = {
