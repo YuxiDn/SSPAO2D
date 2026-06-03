@@ -271,6 +271,22 @@ def add_weighted_metrics(totals: dict[str, float], metrics: dict[str, float], we
         totals[key] = totals.get(key, 0.0) + value * weight
 
 
+COMPACT_METRIC_KEYS = (
+    "mae",
+    "base_mae",
+    "modulation_gain_mae",
+    "modulation_delta_abs",
+    "phase_loss",
+    "attention_max_strength",
+)
+
+
+def select_logged_metrics(metrics: dict[str, float], compact: bool) -> dict[str, float]:
+    if not compact:
+        return dict(metrics)
+    return {key: metrics[key] for key in COMPACT_METRIC_KEYS if key in metrics}
+
+
 def is_attention_modulated_head(head) -> bool:
     return hasattr(head, "phase_head") and hasattr(head, "template_head") and hasattr(head, "last_mode_strength")
 
@@ -330,11 +346,11 @@ def template_coefficient_loss(
     if coeff_mse_weight > 0:
         loss = loss + coeff_mse_weight * _masked_loss(F.mse_loss, pred, target, signed_mask)
 
-    presence_only_mask = ~signed_mask
-    if magnitude_l1_weight > 0 and bool(presence_only_mask.any()):
+    magnitude_only_mask = ~signed_mask
+    if magnitude_l1_weight > 0 and bool(magnitude_only_mask.any()):
         loss = loss + magnitude_l1_weight * F.l1_loss(
-            pred[:, presence_only_mask].abs(),
-            target[:, presence_only_mask].abs(),
+            pred[:, magnitude_only_mask].abs(),
+            target[:, magnitude_only_mask].abs(),
         )
     return loss
 
@@ -342,7 +358,7 @@ def template_coefficient_loss(
 def coefficient_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
-    presence: torch.Tensor,
+    similarity_gate: torch.Tensor,
     threshold: float,
     signed_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
@@ -354,15 +370,15 @@ def coefficient_metrics(
         signed_mask = signed_mask.to(device=pred.device, dtype=torch.bool)
         error = pred - target
         hybrid_pred = pred.clone()
-        presence_only_mask = ~signed_mask
-        hybrid_pred[:, presence_only_mask] = hybrid_pred[:, presence_only_mask].abs()
+        magnitude_only_mask = ~signed_mask
+        hybrid_pred[:, magnitude_only_mask] = hybrid_pred[:, magnitude_only_mask].abs()
         hybrid_target = target.clone()
-        hybrid_target[:, presence_only_mask] = hybrid_target[:, presence_only_mask].abs()
+        hybrid_target[:, magnitude_only_mask] = hybrid_target[:, magnitude_only_mask].abs()
         error = hybrid_pred - hybrid_target
         signed_error = pred[:, signed_mask] - target[:, signed_mask] if signed_mask.any() else pred.new_empty((0,))
         magnitude_error = (
-            pred[:, presence_only_mask].abs() - target[:, presence_only_mask].abs()
-            if presence_only_mask.any()
+            pred[:, magnitude_only_mask].abs() - target[:, magnitude_only_mask].abs()
+            if magnitude_only_mask.any()
             else pred.new_empty((0,))
         )
     mae_per_mode = error.abs().mean(dim=0)
@@ -375,15 +391,13 @@ def coefficient_metrics(
         sign_acc = ((torch.sign(pred[active_for_sign]) == torch.sign(target[active_for_sign])).float().mean()).item()
     else:
         sign_acc = float("nan")
-    pred_active = presence > 0.5
-    presence_acc = (pred_active == active).float().mean().item()
     metrics = {
         "mae": float(error.abs().mean().detach()),
         "rmse": float(torch.sqrt(error.square().mean()).detach()),
         "max_mode_mae": float(mae_per_mode.max().detach()),
         "sign_acc": float(sign_acc),
-        "presence_acc": float(presence_acc),
-        "presence_mean": float(presence.mean().detach()),
+        "similarity_gate_mean": float(similarity_gate.mean().detach()),
+        "similarity_gate_max": float(similarity_gate.max(dim=-1).values.mean().detach()),
     }
     if signed_error.numel() > 0:
         metrics["signed_mae"] = float(signed_error.abs().mean().detach())
@@ -522,8 +536,7 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
     magnitude_l1_weight = float(weights.get("magnitude_l1_weight", 0.0))
-    presence_weight = float(weights.get("presence_bce_weight", 0.0))
-    presence_threshold = float(weights.get("presence_threshold_um", 0.02))
+    active_threshold = float(weights.get("active_threshold_um", 0.02))
     totals: dict[str, float] = {}
     total_steps = 0
 
@@ -531,7 +544,7 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
         for batch in tqdm(loader, desc="train" if train else "val", leave=False):
             image = batch["input"].to(device, non_blocking=True)
             target = batch["coeff"].to(device, non_blocking=True)
-            pred, _, presence, _ = head._template_coefficients(image)
+            pred, _, similarity_gate, _ = head._template_coefficients(image)
             loss = template_coefficient_loss(
                 head,
                 pred,
@@ -540,9 +553,6 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
                 coeff_mse_weight,
                 magnitude_l1_weight,
             )
-            if presence_weight > 0:
-                presence_target = (target.abs() > presence_threshold).to(dtype=presence.dtype)
-                loss = loss + presence_weight * F.binary_cross_entropy(presence, presence_target)
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -551,8 +561,8 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
             metrics = coefficient_metrics(
                 pred.detach(),
                 target.detach(),
-                presence.detach(),
-                presence_threshold,
+                similarity_gate.detach(),
+                active_threshold,
                 _template_signed_mask(head, pred.device),
             )
             metrics["loss"] = float(loss.detach())
@@ -580,10 +590,9 @@ def run_synthetic_same_object_epoch(
     coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
     coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
     magnitude_l1_weight = float(weights.get("magnitude_l1_weight", 0.0))
-    presence_weight = float(weights.get("presence_bce_weight", 0.0))
     otf_feature_weight = float(weights.get("otf_feature_l1_weight", 0.0))
     otf_feature_cosine_weight = float(weights.get("otf_feature_cosine_weight", 0.0))
-    presence_threshold = float(weights.get("presence_threshold_um", 0.02))
+    active_threshold = float(weights.get("active_threshold_um", 0.02))
     zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
     use_reference_features = bool(config.get("training", {}).get("use_object_reference_features", False))
     optics_config = make_optics_config(config)
@@ -607,7 +616,7 @@ def run_synthetic_same_object_epoch(
                 if use_reference_features:
                     zero_target = torch.zeros_like(target)
                     reference = forward_model(obj_batch, zero_target).detach()
-            pred, _, presence, _, encoded = head._template_coefficients(
+            pred, _, similarity_gate, _, encoded = head._template_coefficients(
                 aberrated,
                 reference_image=reference,
                 return_features=True,
@@ -620,9 +629,6 @@ def run_synthetic_same_object_epoch(
                 coeff_mse_weight,
                 magnitude_l1_weight,
             )
-            if presence_weight > 0:
-                presence_target = (target.abs() > presence_threshold).to(dtype=presence.dtype)
-                loss = loss + presence_weight * F.binary_cross_entropy(presence, presence_target)
             otf_loss = torch.zeros((), device=device, dtype=loss.dtype)
             if otf_feature_weight > 0 or otf_feature_cosine_weight > 0:
                 target_features = target_otf_features(
@@ -651,8 +657,8 @@ def run_synthetic_same_object_epoch(
             metrics = coefficient_metrics(
                 pred.detach(),
                 target.detach(),
-                presence.detach(),
-                presence_threshold,
+                similarity_gate.detach(),
+                active_threshold,
                 _template_signed_mask(head, pred.device),
             )
             metrics["loss"] = float(loss.detach())
@@ -689,11 +695,12 @@ def attention_modulated_loss(
         loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
 
     phase_loss = pred.new_zeros(())
-    pred_phase = getattr(head, "last_phase", None)
-    if phase_weight > 0 and pred_phase is not None:
-        target_phase, pupil_mask = target_pupil_opd(target, zernike_indices, pred_phase.shape[-1])
-        pupil_mask = pupil_mask.to(device=pred_phase.device)
-        phase_loss = F.l1_loss(pred_phase[:, pupil_mask], target_phase[:, pupil_mask])
+    base_phase = getattr(head, "last_phase", None)
+    if phase_weight > 0 and base_phase is not None:
+        final_phase, pupil_mask = target_pupil_opd(pred, zernike_indices, base_phase.shape[-1])
+        target_phase, _ = target_pupil_opd(target, zernike_indices, base_phase.shape[-1])
+        pupil_mask = pupil_mask.to(device=final_phase.device)
+        phase_loss = F.l1_loss(final_phase[:, pupil_mask], target_phase[:, pupil_mask])
         loss = loss + phase_weight * phase_loss
 
     strength_loss = pred.new_zeros(())
@@ -712,7 +719,7 @@ def attention_modulated_loss(
         pred.detach(),
         target.detach(),
         torch.zeros_like(pred.detach()),
-        float(weights.get("presence_threshold_um", 0.02)),
+        float(weights.get("active_threshold_um", 0.02)),
         None,
     )
     metrics.update(mode_strength_metrics(None if mode_strength is None else mode_strength.detach(), target.detach()))
@@ -907,9 +914,9 @@ def save_validation_coefficient_figures(
             sample = dataset[int(dataset_idx)]
             image = sample["input"][None].to(device)
             target = sample["coeff"].detach().cpu().numpy()
-            pred, scores, presence, sign = head._template_coefficients(image)
+            pred, scores, similarity_gate, sign = head._template_coefficients(image)
             pred_np = pred[0].detach().cpu().numpy()
-            presence_np = presence[0].detach().cpu().numpy()
+            similarity_gate_np = similarity_gate[0].detach().cpu().numpy()
             sign_np = sign[0].detach().cpu().numpy()
             score_np = scores[0].detach().cpu().numpy()
             error_np = pred_np - target
@@ -928,7 +935,14 @@ def save_validation_coefficient_figures(
             axes[0].grid(axis="y", linestyle="--", alpha=0.35)
 
             axes[1].bar(x_axis, error_np, width=0.55, color="#dc2626", label="prediction - ground truth")
-            axes[1].plot(x_axis, presence_np, marker="o", linewidth=1.2, color="#059669", label="presence")
+            axes[1].plot(
+                x_axis,
+                similarity_gate_np,
+                marker="o",
+                linewidth=1.2,
+                color="#059669",
+                label="similarity gate",
+            )
             axes[1].plot(x_axis, sign_np, marker="x", linewidth=1.2, color="#9333ea", label="sign")
             axes[1].axhline(0.0, color="black", linewidth=0.8)
             axes[1].set_ylabel("error / gate")
@@ -948,7 +962,7 @@ def save_validation_coefficient_figures(
                 target=target,
                 prediction=pred_np,
                 error=error_np,
-                presence=presence_np,
+                similarity_gate=similarity_gate_np,
                 sign=sign_np,
                 scores=score_np,
                 input_path=str(sample["input_path"]),
@@ -992,27 +1006,46 @@ def save_attention_modulated_validation_figures(
 
             base = getattr(head, "last_a_base", None)
             strength = getattr(head, "last_mode_strength", None)
-            modulation = getattr(head, "last_modulation", None)
+            similarity_gate = getattr(head, "last_similarity_gate", None)
+            residual = getattr(head, "last_template_residual", getattr(head, "last_modulation", None))
+            template = getattr(head, "last_a_template", None)
             phase = getattr(head, "last_phase", None)
             scores = getattr(head, "last_scores", None)
-            if base is None or strength is None or modulation is None or phase is None:
+            signed_score = getattr(head, "last_signed_score", None)
+            if base is None or strength is None or residual is None or phase is None:
                 continue
 
             target_phase, pupil_mask = target_pupil_opd(target, zernike_indices, phase.shape[-1])
+            final_phase, _ = target_pupil_opd(final, zernike_indices, phase.shape[-1])
             pupil_mask_np = pupil_mask.detach().cpu().numpy().astype(bool)
             input_np = image[0, 0].detach().float().cpu().numpy()
             target_np = target[0].detach().float().cpu().numpy()
             base_np = base[0].detach().float().cpu().numpy()
             final_np = final[0].detach().float().cpu().numpy()
             strength_np = strength[0].detach().float().cpu().numpy()
-            modulation_np = modulation[0].detach().float().cpu().numpy()
-            pred_phase_np = phase[0].detach().float().cpu().numpy()
+            similarity_gate_np = (
+                similarity_gate[0].detach().float().cpu().numpy()
+                if similarity_gate is not None
+                else np.zeros_like(strength_np)
+            )
+            residual_np = residual[0].detach().float().cpu().numpy()
+            template_np = (
+                template[0].detach().float().cpu().numpy()
+                if template is not None
+                else np.zeros_like(residual_np)
+            )
+            pred_phase_np = final_phase[0].detach().float().cpu().numpy()
             target_phase_np = target_phase[0].detach().float().cpu().numpy()
             phase_error_np = pred_phase_np - target_phase_np
             if scores is not None:
                 scores_np = scores[0].detach().float().cpu().numpy()
             else:
                 scores_np = np.zeros((len(zernike_indices), 2), dtype=np.float32)
+            signed_score_np = (
+                signed_score[0].detach().float().cpu().numpy()
+                if signed_score is not None
+                else np.zeros((len(zernike_indices),), dtype=np.float32)
+            )
 
             base_err = np.abs(base_np - target_np)
             final_err = np.abs(final_np - target_np)
@@ -1059,9 +1092,10 @@ def save_attention_modulated_validation_figures(
             axes[1, 1].set_ylabel("MAE gain (um)")
 
             axes[1, 2].plot(x_axis, strength_np, marker="o", label="attention strength", color="#2563eb")
-            axes[1, 2].plot(x_axis, modulation_np, marker="s", label="modulation r_k", color="#dc2626")
-            axes[1, 2].axhline(1.0, color="black", linewidth=0.8, linestyle="--")
-            axes[1, 2].set_title("Attention and modulation")
+            axes[1, 2].plot(x_axis, similarity_gate_np, marker="x", label="similarity gate", color="#059669")
+            axes[1, 2].bar(x_axis, residual_np, alpha=0.55, label="template residual", color="#dc2626")
+            axes[1, 2].axhline(0.0, color="black", linewidth=0.8)
+            axes[1, 2].set_title("Attention and residual")
             axes[1, 2].legend(fontsize=8)
 
             im = axes[2, 0].imshow(phase_error_np, cmap="coolwarm", vmin=-error_vmax, vmax=error_vmax)
@@ -1070,8 +1104,9 @@ def save_attention_modulated_validation_figures(
             axes[2, 0].axis("off")
             fig.colorbar(im, ax=axes[2, 0], fraction=0.046, pad=0.04)
 
-            axes[2, 1].plot(x_axis, scores_np[:, 0], marker="o", label="-eps score", color="#7c3aed")
-            axes[2, 1].plot(x_axis, scores_np[:, 1], marker="o", label="+eps score", color="#ea580c")
+            axes[2, 1].plot(x_axis, scores_np[:, 0], marker="o", label="+eps score", color="#7c3aed")
+            axes[2, 1].plot(x_axis, scores_np[:, 1], marker="o", label="-eps score", color="#ea580c")
+            axes[2, 1].plot(x_axis, signed_score_np, marker="s", label="signed diff score", color="#059669")
             axes[2, 1].set_title("Template scores")
             axes[2, 1].legend(fontsize=8)
 
@@ -1101,10 +1136,14 @@ def save_attention_modulated_validation_figures(
                 target=target_np,
                 base=base_np,
                 final=final_np,
+                template=template_np,
+                residual=residual_np,
                 mode_gain=mode_gain,
                 strength=strength_np,
-                modulation=modulation_np,
+                similarity_gate=similarity_gate_np,
+                modulation=residual_np,
                 scores=scores_np,
+                signed_score=signed_score_np,
                 pred_phase=pred_phase_np,
                 target_phase=target_phase_np,
                 phase_error=phase_error_np,
@@ -1162,13 +1201,13 @@ def save_same_object_batch_figure(
     was_training = head.training
     head.eval()
     with torch.no_grad():
-        pred, _, presence, sign = head._template_coefficients(image_batch)
+        pred, _, similarity_gate, sign = head._template_coefficients(image_batch)
     head.train(was_training)
 
     target_np = target_batch.detach().cpu().numpy()
     pred_np = pred.detach().cpu().numpy()
     error_np = pred_np - target_np
-    presence_np = presence.detach().cpu().numpy()
+    similarity_gate_np = similarity_gate.detach().cpu().numpy()
     sign_np = sign.detach().cpu().numpy()
     vmax = float(max(np.abs(target_np).max(), np.abs(pred_np).max(), 1e-6))
     err_vmax = float(max(np.abs(error_np).max(), 1e-6))
@@ -1178,11 +1217,11 @@ def save_same_object_batch_figure(
         ("ground truth coefficients (um)", target_np, vmax),
         ("template prediction (um)", pred_np, vmax),
         ("prediction error (um)", error_np, err_vmax),
-        ("presence gate", presence_np, 1.0),
+        ("similarity gate", similarity_gate_np, 1.0),
     ]
     for ax, (title, values, limit) in zip(axes, panels, strict=True):
         im = ax.imshow(values, aspect="auto", cmap="coolwarm", vmin=-limit, vmax=limit)
-        if title == "presence gate":
+        if title == "similarity gate":
             im.set_clim(0.0, 1.0)
             im.set_cmap("viridis")
         ax.set_ylabel("sample")
@@ -1207,7 +1246,7 @@ def save_same_object_batch_figure(
         target=target_np,
         prediction=pred_np,
         error=error_np,
-        presence=presence_np,
+        similarity_gate=similarity_gate_np,
         sign=sign_np,
         input_paths=np.asarray(input_paths),
         coeff_paths=np.asarray(coeff_paths),
@@ -1414,9 +1453,10 @@ def main() -> None:
             else:
                 val_metrics = run_epoch(head, val_loader, optimizer, device, False, config)
             scheduler.step()
+            compact_metrics = bool(config.get("logging", {}).get("compact_metrics", True))
             row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"], "batch_size": train_batch_size}
-            row.update({f"train_{key}": value for key, value in train_metrics.items()})
-            row.update({f"val_{key}": value for key, value in val_metrics.items()})
+            row.update({f"train_{key}": value for key, value in select_logged_metrics(train_metrics, compact_metrics).items()})
+            row.update({f"val_{key}": value for key, value in select_logged_metrics(val_metrics, compact_metrics).items()})
             if writer is None:
                 writer = csv.DictWriter(f, fieldnames=list(row.keys()))
                 writer.writeheader()
@@ -1425,12 +1465,11 @@ def main() -> None:
             print(
                 f"epoch={epoch:03d} "
                 f"train_mae={train_metrics['mae']:.5f} val_mae={val_metrics['mae']:.5f} "
-                f"val_signed_mae={val_metrics.get('signed_mae', float('nan')):.5f} "
                 f"val_base_mae={val_metrics.get('base_mae', float('nan')):.5f} "
-                f"val_mod_gain={val_metrics.get('modulation_gain_mae', float('nan')):.5f} "
-                f"val_sign={val_metrics['sign_acc']:.3f} "
-                f"val_strength_kl={val_metrics.get('strength_kl', float('nan')):.4f} "
-                f"val_presence={val_metrics.get('presence_acc', float('nan')):.3f}"
+                f"val_gain={val_metrics.get('modulation_gain_mae', float('nan')):.5f} "
+                f"val_phase={val_metrics.get('phase_loss', float('nan')):.4f} "
+                f"attn_max={val_metrics.get('attention_max_strength', float('nan')):.3f} "
+                f"resid={val_metrics.get('modulation_delta_abs', float('nan')):.5f}"
             )
             if attention_modulated:
                 save_attention_modulated_validation_figures(model, val_set, output_dir, device, epoch, config, use_amp)

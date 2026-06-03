@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_attention_modulated_pupil_phase_e005_b128_16obj_32ch_4blk_100ep",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_attention_residual_similarity_diffsign_pupil_phase_e005_b32_4obj_32ch_4blk_40step_30ep",
   "model": {
     "name": "abesplit2d",
     "in_channels": 1,
@@ -40,7 +40,7 @@
       "signed_zernike_indices": [6, 7, 8, 9, 15],
       "modulation_lambda": 0.5,
       "attention_temperature": 8.0,
-      "centered_modulation": true
+      "centered_modulation": false
     }
   },
   "optics": {
@@ -71,16 +71,16 @@
     }
   },
   "training": {
-    "epochs": 100,
-    "batch_size": 128,
-    "val_batch_size": 128,
+    "epochs": 30,
+    "batch_size": 32,
+    "val_batch_size": 32,
     "micro_batch_size": 32,
     "same_object_batches": true,
     "synthetic_same_object_batches": true,
-    "synthetic_batches_per_epoch": 250,
-    "objects_per_synthetic_batch": 16,
+    "synthetic_batches_per_epoch": 40,
+    "objects_per_synthetic_batch": 4,
     "seed": 20260602,
-    "num_workers": 4,
+    "num_workers": 0,
     "lr": 0.0001,
     "min_lr": 0.000005,
     "weight_decay": 0.00001,
@@ -101,13 +101,15 @@
     "coeff_l1_weight": 1.0,
     "coeff_mse_weight": 0.1,
     "magnitude_l1_weight": 0.0,
-    "presence_bce_weight": 0.0,
     "mode_strength_kl_weight": 0.2,
     "pupil_phase_l1_weight": 1.0,
     "reprojection_l1_weight": 0.0,
     "otf_feature_cosine_weight": 0.0,
     "otf_feature_l1_weight": 0.0,
-    "presence_threshold_um": 0.02
+    "active_threshold_um": 0.02
+  },
+  "logging": {
+    "compact_metrics": true
   },
   "visualization": {
     "random_val_samples": 4,

@@ -210,6 +210,7 @@ class ZernikeOTFTemplateBank2D(nn.Module):
             raise ValueError("epsilon_um must be a scalar or have one value per Zernike mode")
         self.register_buffer("epsilon_um", epsilon, persistent=True)
         self.register_buffer("templates", torch.empty(0), persistent=False)
+        self.register_buffer("signed_templates", torch.empty(0), persistent=False)
         self.register_buffer("rho", torch.empty(0), persistent=False)
         self.register_buffer("pupil_mask", torch.empty(0), persistent=False)
         if self.image_size is not None:
@@ -255,6 +256,8 @@ class ZernikeOTFTemplateBank2D(nn.Module):
 
         templates = _zscore_template(raw_templates, self.eps)
         templates = _l2_normalize_template(templates, self.eps)
+        signed_templates = _zscore_template(raw_templates[:, 0] - raw_templates[:, 1], self.eps)
+        signed_templates = _l2_normalize_template(signed_templates, self.eps)
 
         rho, _, pupil_mask = pupil_coordinates_2d(
             image_size,
@@ -270,6 +273,7 @@ class ZernikeOTFTemplateBank2D(nn.Module):
 
         self.image_size = image_size
         self.templates = templates
+        self.signed_templates = signed_templates
         self.rho = rho.to(dtype=dtype)
         self.pupil_mask = pupil_mask.to(dtype=dtype)
 
@@ -280,6 +284,7 @@ class ZernikeOTFTemplateBank2D(nn.Module):
             self.rebuild(image_size, device=image.device, dtype=image.dtype)
         elif self.templates.device != image.device or self.templates.dtype != image.dtype:
             self.templates = self.templates.to(device=image.device, dtype=image.dtype)
+            self.signed_templates = self.signed_templates.to(device=image.device, dtype=image.dtype)
             self.rho = self.rho.to(device=image.device, dtype=image.dtype)
             self.pupil_mask = self.pupil_mask.to(device=image.device, dtype=image.dtype)
         return self.templates
@@ -394,12 +399,13 @@ class OTFTemplateAttentionHead2D(nn.Module):
         nn.init.constant_(self.confidence_head[-1].bias, float(confidence_init))
 
         self.last_scores: torch.Tensor | None = None
-        self.last_presence: torch.Tensor | None = None
+        self.last_similarity_gate: torch.Tensor | None = None
         self.last_sign: torch.Tensor | None = None
         self.last_confidence: torch.Tensor | None = None
         self.last_a_base: torch.Tensor | None = None
         self.last_a_template: torch.Tensor | None = None
         self.last_attention_magnitude: torch.Tensor | None = None
+        self.last_signed_score: torch.Tensor | None = None
 
     def _input_features(self, image: torch.Tensor, reference_image: torch.Tensor | None = None) -> torch.Tensor:
         spectrum = _centered_fft2(image, self.fft_shift, subtract_mean=self.input_center)
@@ -456,7 +462,8 @@ class OTFTemplateAttentionHead2D(nn.Module):
         scores = torch.einsum("bchw,kqchw->bkq", features, templates.to(dtype=features.dtype, device=features.device))
         scores_pos = scores[..., 0]
         scores_neg = scores[..., 1]
-        signed_score = scores_pos - scores_neg
+        signed_templates = self.template_bank.signed_templates.to(dtype=features.dtype, device=features.device)
+        signed_score = torch.einsum("bchw,kchw->bk", features, signed_templates)
         best_score = torch.maximum(scores_pos, scores_neg)
 
         alpha = torch.nn.functional.softplus(self.raw_alpha)
@@ -465,14 +472,17 @@ class OTFTemplateAttentionHead2D(nn.Module):
             dtype=signed_score.dtype,
         )
         sign = torch.tanh(response_scale[None, :] * signed_score)
-        presence = torch.sigmoid(alpha * (best_score - self.tau.to(device=image.device, dtype=best_score.dtype)))
-        max_amp = self.max_amp_um.to(device=image.device, dtype=presence.dtype)
-        magnitude = max_amp[None, :] * presence
+        similarity_weight = F.softplus(alpha * best_score)
+        similarity_weight = similarity_weight / similarity_weight.mean(dim=-1, keepdim=True).clamp_min(self.eps)
+        similarity_gate = similarity_weight.to(dtype=image.dtype)
+        max_amp = self.max_amp_um.to(device=image.device, dtype=similarity_gate.dtype)
+        magnitude = max_amp[None, :] * similarity_gate
         signed_mask = self.template_signed_mode_mask.to(device=image.device, dtype=torch.bool)
         a_signed = magnitude * sign
         a_template = torch.where(signed_mask[None, :], a_signed, magnitude)
         self.last_attention_magnitude = magnitude.detach()
-        return a_template, scores, presence, sign
+        self.last_signed_score = signed_score.detach()
+        return a_template, scores, similarity_gate, sign
 
     def _template_coefficients(
         self,
@@ -488,14 +498,14 @@ class OTFTemplateAttentionHead2D(nn.Module):
 
     def forward_with_image(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
         a_base = self.base_head(features)
-        a_template, scores, presence, sign = self._template_coefficients(image)
+        a_template, scores, similarity_gate, sign = self._template_coefficients(image)
 
         scores_pos = scores[..., 0]
         scores_neg = scores[..., 1]
         best_score = torch.maximum(scores_pos, scores_neg)
         signed_score = scores_pos - scores_neg
         signed_mask = self.template_signed_mode_mask.to(device=image.device, dtype=torch.bool)
-        template_proposal = torch.where(signed_mask[None, :], a_template, presence * a_base)
+        template_proposal = torch.where(signed_mask[None, :], a_template, similarity_gate * a_base)
         confidence_inputs = torch.stack(
             [
                 scores_pos,
@@ -511,7 +521,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
         a_final = confidence * template_proposal + (1.0 - confidence) * a_base
 
         self.last_scores = scores.detach()
-        self.last_presence = presence.detach()
+        self.last_similarity_gate = similarity_gate.detach()
         self.last_sign = sign.detach()
         self.last_confidence = confidence.detach()
         self.last_a_base = a_base.detach()
@@ -555,6 +565,7 @@ class AttentionModulatedPupilPhaseHead2D(nn.Module):
         modulation_lambda: float = 0.5,
         attention_temperature: float = 8.0,
         centered_modulation: bool = True,
+        signed_zernike_indices: Iterable[int] | None = None,
         eps: float = 1e-8,
     ) -> None:
         super().__init__()
@@ -596,7 +607,7 @@ class AttentionModulatedPupilPhaseHead2D(nn.Module):
             input_phase_mask_percentile=input_phase_mask_percentile,
             otf_mtf_threshold=otf_mtf_threshold,
             eps=eps,
-            signed_zernike_indices=None,
+            signed_zernike_indices=signed_zernike_indices,
         )
         self.raw_modulation_lambda = nn.Parameter(
             torch.tensor(_softplus_inverse(max(float(modulation_lambda), eps)), dtype=torch.float32)
@@ -605,29 +616,37 @@ class AttentionModulatedPupilPhaseHead2D(nn.Module):
             torch.tensor(_softplus_inverse(max(float(attention_temperature), eps)), dtype=torch.float32)
         )
         self.last_a_base: torch.Tensor | None = None
+        self.last_a_template: torch.Tensor | None = None
+        self.last_template_residual: torch.Tensor | None = None
         self.last_mode_strength: torch.Tensor | None = None
+        self.last_similarity_gate: torch.Tensor | None = None
         self.last_modulation: torch.Tensor | None = None
         self.last_scores: torch.Tensor | None = None
+        self.last_signed_score: torch.Tensor | None = None
         self.last_phase: torch.Tensor | None = None
 
     def forward_with_image(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
         a_base = self.phase_head(features)
-        _, scores, _, _ = self.template_head._template_coefficients(image)
+        a_template, scores, similarity_gate, _ = self.template_head._template_coefficients(image)
         best_score = torch.maximum(scores[..., 0], scores[..., 1])
         temperature = F.softplus(self.raw_attention_temperature).to(device=features.device, dtype=best_score.dtype)
         mode_strength = torch.softmax(temperature * best_score, dim=-1)
-        modulation_lambda = F.softplus(self.raw_modulation_lambda).to(device=features.device, dtype=a_base.dtype)
+        residual_scale = F.softplus(self.raw_modulation_lambda).to(device=features.device, dtype=a_base.dtype)
         if self.centered_modulation:
-            centered = mode_strength - mode_strength.mean(dim=-1, keepdim=True)
-            modulation = 1.0 + modulation_lambda * centered.to(dtype=a_base.dtype)
+            residual_gate = mode_strength - mode_strength.mean(dim=-1, keepdim=True)
         else:
-            modulation = 1.0 + modulation_lambda * mode_strength.to(dtype=a_base.dtype)
-        a_final = modulation * a_base
+            residual_gate = torch.ones_like(mode_strength)
+        template_residual = residual_scale * residual_gate.to(dtype=a_base.dtype) * a_template.to(dtype=a_base.dtype)
+        a_final = a_base + template_residual
 
         self.last_a_base = a_base
+        self.last_a_template = a_template
+        self.last_template_residual = template_residual
         self.last_mode_strength = mode_strength
-        self.last_modulation = modulation
+        self.last_similarity_gate = similarity_gate
+        self.last_modulation = template_residual
         self.last_scores = scores
+        self.last_signed_score = self.template_head.last_signed_score
         self.last_phase = self.phase_head.last_phase
         return a_final
 

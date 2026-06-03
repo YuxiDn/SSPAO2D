@@ -220,6 +220,7 @@ def make_aberration_head_2d(
             modulation_lambda=template_modulation_lambda,
             attention_temperature=template_attention_temperature,
             centered_modulation=template_centered_modulation,
+            signed_zernike_indices=template_signed_zernike_indices,
         )
     raise ValueError(f"Unsupported aberration_head_type: {head_type}")
 
