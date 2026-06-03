@@ -245,7 +245,7 @@ def set_trainable_template_params(head, train_thresholds: bool = True) -> list[t
         for param in amplitude_head.parameters():
             param.requires_grad = True
     if train_thresholds:
-        for name in ("raw_eta", "raw_alpha", "tau"):
+        for name in ("raw_eta", "raw_alpha", "raw_response_scale", "tau"):
             param = getattr(head, name)
             param.requires_grad = True
     return [param for param in head.parameters() if param.requires_grad]
@@ -293,6 +293,7 @@ def target_otf_features(
     optics_config: AO2DConfig,
     fft_shift: bool,
     eps: float,
+    otf_mtf_threshold: float = 0.03,
 ) -> torch.Tensor:
     with torch.no_grad():
         zero = torch.zeros_like(coefficients)
@@ -306,8 +307,12 @@ def target_otf_features(
         log_amp = torch.log1p(torch.abs(otf)) - torch.log1p(torch.abs(otf0))
         relative_phase = otf * torch.conj(otf0)
         phase_den = torch.abs(relative_phase).clamp_min(eps)
-        phase_cos = relative_phase.real / phase_den
-        phase_sin = relative_phase.imag / phase_den
+        mtf_support = (
+            (torch.abs(otf) > float(otf_mtf_threshold))
+            & (torch.abs(otf0) > float(otf_mtf_threshold))
+        ).to(dtype=coefficients.dtype)
+        phase_cos = relative_phase.real / phase_den * mtf_support
+        phase_sin = relative_phase.imag / phase_den * mtf_support
         target = torch.stack([log_amp, phase_cos, phase_sin], dim=1).real.to(dtype=coefficients.dtype)
         return normalize_otf_feature_target(target, eps)
 
@@ -378,6 +383,7 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
             metrics["loss"] = float(loss.detach())
             metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())
+            metrics["response_scale_mean"] = float(torch.nn.functional.softplus(head.raw_response_scale).mean().detach())
             metrics["tau_mean"] = float(head.tau.mean().detach())
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0.0) + value
@@ -443,6 +449,7 @@ def run_synthetic_same_object_epoch(
                     optics_config,
                     bool(getattr(head, "fft_shift", False)),
                     float(getattr(head, "eps", 1e-8)),
+                    float(getattr(head, "otf_mtf_threshold", 0.03)),
                 ).to(dtype=encoded.dtype)
                 if otf_feature_weight > 0:
                     otf_loss = otf_loss + otf_feature_weight * F.l1_loss(encoded, target_features)
@@ -462,6 +469,7 @@ def run_synthetic_same_object_epoch(
             metrics["loss"] = float(loss.detach())
             metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())
+            metrics["response_scale_mean"] = float(torch.nn.functional.softplus(head.raw_response_scale).mean().detach())
             metrics["tau_mean"] = float(head.tau.mean().detach())
             metrics["otf_loss"] = float(otf_loss.detach())
             for key, value in metrics.items():

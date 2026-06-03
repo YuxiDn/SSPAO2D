@@ -66,13 +66,24 @@ def _template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         template_encoder_kernel_size=int(
             template_cfg.get("encoder_depthwise_kernel", config.get("template_encoder_kernel_size", 5))
         ),
+        template_encoder_type=str(template_cfg.get("encoder_type", config.get("template_encoder_type", "depthwise"))),
         template_eta=float(template_cfg.get("eta", config.get("template_eta", 5.0))),
         template_alpha=float(template_cfg.get("alpha", config.get("template_alpha", 10.0))),
         template_tau_init=float(template_cfg.get("tau_init", config.get("template_tau_init", 0.3))),
         template_confidence_init=float(
             template_cfg.get("confidence_init", config.get("template_confidence_init", 1.4))
         ),
-        template_fft_shift=bool(template_cfg.get("fft_shift", config.get("template_fft_shift", config.get("fft_shift", False)))),
+        template_fft_shift=bool(template_cfg.get("fft_shift", config.get("template_fft_shift", config.get("fft_shift", True)))),
+        template_input_center=bool(template_cfg.get("input_center", config.get("template_input_center", True))),
+        template_input_phase_mask_percentile=float(
+            template_cfg.get("input_phase_mask_percentile", config.get("template_input_phase_mask_percentile", 72.0))
+        ),
+        template_input_feature_channels=int(
+            template_cfg.get("input_feature_channels", config.get("template_input_feature_channels", 5))
+        ),
+        template_otf_mtf_threshold=float(
+            template_cfg.get("otf_mtf_threshold", config.get("template_otf_mtf_threshold", 0.03))
+        ),
     )
 
 

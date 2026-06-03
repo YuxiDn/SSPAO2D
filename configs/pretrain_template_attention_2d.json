@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_template_attention_synth_sameobj_imageonly_otfcos_b64_64ch_3blk_100ep",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_template_attention_synth_derivative_unet_e005_b128_32ch_4blk_100ep",
   "model": {
     "name": "abesplit2d",
     "in_channels": 1,
@@ -24,9 +24,15 @@
         0.70, 0.68, 0.68, 0.53, 0.53, 0.58, 0.57,
         0.41, 0.45, 0.43, 0.48, 0.46, 0.35
       ],
-      "encoder_channels": 64,
-      "encoder_blocks": 3,
+      "encoder_type": "unet",
+      "encoder_channels": 32,
+      "encoder_blocks": 4,
       "encoder_depthwise_kernel": 5,
+      "fft_shift": true,
+      "input_center": true,
+      "input_phase_mask_percentile": 72.0,
+      "input_feature_channels": 5,
+      "otf_mtf_threshold": 0.03,
       "eta": 5.0,
       "alpha": 10.0,
       "tau_init": 0.3,
@@ -63,8 +69,8 @@
   },
   "training": {
     "epochs": 100,
-    "batch_size": 64,
-    "val_batch_size": 64,
+    "batch_size": 128,
+    "val_batch_size": 128,
     "same_object_batches": true,
     "synthetic_same_object_batches": true,
     "synthetic_batches_per_epoch": 250,
