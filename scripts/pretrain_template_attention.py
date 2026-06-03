@@ -502,10 +502,13 @@ def run_synthetic_same_object_epoch(
     with torch.set_grad_enabled(train):
         for batch in tqdm(loader, desc="train" if train else "val", leave=False):
             obj = batch["object"].to(device, non_blocking=True)
-            if obj.shape[0] != 1:
-                obj = obj[:1]
+            if obj.shape[0] < 1:
+                raise ValueError("Synthetic object batch is empty")
             target = random_coefficients_batch(coeff_batch_size, zernike_indices, device, config).to(dtype=obj.dtype)
-            obj_batch = obj.expand(coeff_batch_size, -1, -1, -1).contiguous()
+            repeats = torch.full((obj.shape[0],), coeff_batch_size // obj.shape[0], device=device, dtype=torch.long)
+            repeats[: coeff_batch_size % obj.shape[0]] += 1
+            object_index = torch.repeat_interleave(torch.arange(obj.shape[0], device=device), repeats)
+            obj_batch = obj.index_select(0, object_index).contiguous()
             with torch.no_grad():
                 aberrated = forward_model(obj_batch, target).detach()
                 reference = None
@@ -768,15 +771,18 @@ def make_dataset(config: dict, split: str, data_root: Path) -> TemplateAttention
 
 def make_object_dataset(config: dict, data_root: Path) -> CleanObjectDataset:
     data_cfg = config["data"]["train"]
+    training = config["training"]
     patch_size = config["data"].get("patch_size")
     if patch_size is not None:
         patch_size = tuple(int(v) for v in patch_size)
     object_dir = resolve_path(data_cfg.get("object_dir", "OBJ"), data_root)
+    synthetic_batches = int(training.get("synthetic_batches_per_epoch", data_cfg.get("samples_per_epoch", 250)))
+    objects_per_batch = int(training.get("objects_per_synthetic_batch", 1))
     return CleanObjectDataset(
         object_dir,
         patch_size=patch_size,
         crop_mode=str(data_cfg.get("object_crop_mode", data_cfg.get("crop_mode", "random"))),
-        samples_per_epoch=int(config["training"].get("synthetic_batches_per_epoch", data_cfg.get("samples_per_epoch", 250))),
+        samples_per_epoch=synthetic_batches * max(1, objects_per_batch),
         input_scale_method=str(config["data"].get("input_scale_method", "percentile")),
         input_scale_percentile=float(config["data"].get("input_scale_percentile", 99.9)),
     )
@@ -828,12 +834,14 @@ def make_loader(
 
 
 def make_object_loader(dataset: CleanObjectDataset, config: dict, epoch: int) -> DataLoader:
+    objects_per_batch = max(1, int(config["training"].get("objects_per_synthetic_batch", 1)))
     return DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=objects_per_batch,
         shuffle=True,
         num_workers=int(config["training"].get("num_workers", 4)),
         pin_memory=torch.cuda.is_available(),
+        drop_last=True,
     )
 
 

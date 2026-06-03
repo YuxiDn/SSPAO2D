@@ -186,3 +186,14 @@ a_final = confidence * template_proposal + (1 - confidence) * a_base
 ## 当前风险
 
 从 buffer 可视化看，很多 mode 的 `+eps` 和 `-eps` template 高度相似，尤其是部分低阶和高阶 mode。因此该分支更适合作为 mode presence 和频域结构先验；对于符号难分的 mode，仍应依赖主干回归分支和融合置信度。
+
+## Synthetic Pretrain Batch
+
+synthetic pretrain 不再使用单个 OBJ 扩展成整个 batch。当前配置为：
+
+```text
+batch_size = 128
+objects_per_synthetic_batch = 8
+```
+
+每个优化 step 从 clean OBJ dataset 中取 8 个 OBJ，然后给每个 OBJ 分配约 `128 / 8 = 16` 组随机 Zernike 系数，再通过 forward model 生成 128 张带像差图像。这样保留了同一 OBJ 多像差的可控监督，同时 batch 内也包含多个 OBJ，更接近实际训练分布。
