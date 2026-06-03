@@ -240,12 +240,8 @@ def set_trainable_template_params(head, train_thresholds: bool = True) -> list[t
         param.requires_grad = False
     for param in head.encoder.parameters():
         param.requires_grad = True
-    amplitude_head = getattr(head, "amplitude_head", None)
-    if amplitude_head is not None:
-        for param in amplitude_head.parameters():
-            param.requires_grad = True
     if train_thresholds:
-        for name in ("raw_eta", "raw_alpha", "raw_response_scale", "tau"):
+        for name in ("raw_alpha", "raw_response_scale", "tau"):
             param = getattr(head, name)
             param.requires_grad = True
     return [param for param in head.parameters() if param.requires_grad]
@@ -468,7 +464,6 @@ def run_epoch(head, loader, optimizer, device, train: bool, config: dict) -> dic
                 _template_signed_mask(head, pred.device),
             )
             metrics["loss"] = float(loss.detach())
-            metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())
             metrics["response_scale_mean"] = float(torch.nn.functional.softplus(head.raw_response_scale).mean().detach())
             metrics["tau_mean"] = float(head.tau.mean().detach())
@@ -566,7 +561,6 @@ def run_synthetic_same_object_epoch(
                 _template_signed_mask(head, pred.device),
             )
             metrics["loss"] = float(loss.detach())
-            metrics["eta"] = float(torch.nn.functional.softplus(head.raw_eta).detach())
             metrics["alpha"] = float(torch.nn.functional.softplus(head.raw_alpha).detach())
             metrics["response_scale_mean"] = float(torch.nn.functional.softplus(head.raw_response_scale).mean().detach())
             metrics["tau_mean"] = float(head.tau.mean().detach())

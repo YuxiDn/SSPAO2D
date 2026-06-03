@@ -209,7 +209,6 @@ class ZernikeOTFTemplateBank2D(nn.Module):
             raise ValueError("epsilon_um must be a scalar or have one value per Zernike mode")
         self.register_buffer("epsilon_um", epsilon, persistent=True)
         self.register_buffer("templates", torch.empty(0), persistent=False)
-        self.register_buffer("derivative_templates", torch.empty(0), persistent=False)
         self.register_buffer("rho", torch.empty(0), persistent=False)
         self.register_buffer("pupil_mask", torch.empty(0), persistent=False)
         if self.image_size is not None:
@@ -256,12 +255,6 @@ class ZernikeOTFTemplateBank2D(nn.Module):
         templates = _zscore_template(raw_templates, self.eps)
         templates = _l2_normalize_template(templates, self.eps)
 
-        derivative_templates = (raw_templates[:, 0] - raw_templates[:, 1]) / (
-            2.0 * epsilon.to(device=device, dtype=dtype)[:, None, None, None]
-        )
-        derivative_templates = _zscore_template(derivative_templates, self.eps)
-        derivative_templates = _l2_normalize_template(derivative_templates, self.eps)
-
         rho, _, pupil_mask = pupil_coordinates_2d(
             image_size,
             self.optics_config.pixel_size,
@@ -276,7 +269,6 @@ class ZernikeOTFTemplateBank2D(nn.Module):
 
         self.image_size = image_size
         self.templates = templates
-        self.derivative_templates = derivative_templates
         self.rho = rho.to(dtype=dtype)
         self.pupil_mask = pupil_mask.to(dtype=dtype)
 
@@ -287,7 +279,6 @@ class ZernikeOTFTemplateBank2D(nn.Module):
             self.rebuild(image_size, device=image.device, dtype=image.dtype)
         elif self.templates.device != image.device or self.templates.dtype != image.dtype:
             self.templates = self.templates.to(device=image.device, dtype=image.dtype)
-            self.derivative_templates = self.derivative_templates.to(device=image.device, dtype=image.dtype)
             self.rho = self.rho.to(device=image.device, dtype=image.dtype)
             self.pupil_mask = self.pupil_mask.to(device=image.device, dtype=image.dtype)
         return self.templates
@@ -315,17 +306,14 @@ class OTFTemplateAttentionHead2D(nn.Module):
         encoder_blocks: int = 3,
         encoder_kernel_size: int = 5,
         encoder_type: str = "depthwise",
-        eta: float = 5.0,
         alpha: float = 10.0,
         tau_init: float = 0.3,
         confidence_init: float = 1.4,
         fft_shift: bool = True,
         input_center: bool = True,
         input_phase_mask_percentile: float = 72.0,
-        input_feature_channels: int = 5,
         otf_mtf_threshold: float = 0.03,
         eps: float = 1e-8,
-        use_amplitude_head: bool = True,
         response_scale_init: float = 50.0,
         signed_zernike_indices: Iterable[int] | None = None,
     ) -> None:
@@ -338,10 +326,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
         self.fft_shift = bool(fft_shift)
         self.input_center = bool(input_center)
         self.input_phase_mask_percentile = float(input_phase_mask_percentile)
-        self.input_feature_channels = int(input_feature_channels)
         self.otf_mtf_threshold = float(otf_mtf_threshold)
-        if self.input_feature_channels not in {3, 5}:
-            raise ValueError("input_feature_channels must be 3 or 5")
         self.base_head = ZernikeResNetRegression2D(
             in_channels,
             len(indices),
@@ -362,7 +347,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
         self.encoder_type = encoder_type
         if encoder_type in {"depthwise", "depthwise_separable", "separable", "lightweight"}:
             self.encoder = LightweightOTFEncoder2D(
-                in_channels=self.input_feature_channels,
+                in_channels=5,
                 hidden_channels=encoder_channels,
                 out_channels=3,
                 blocks=encoder_blocks,
@@ -370,7 +355,7 @@ class OTFTemplateAttentionHead2D(nn.Module):
             )
         elif encoder_type in {"unet", "u_net", "lightweight_unet"}:
             self.encoder = LightweightOTFUNetEncoder2D(
-                in_channels=self.input_feature_channels,
+                in_channels=5,
                 hidden_channels=encoder_channels,
                 out_channels=3,
                 depth=max(1, encoder_blocks),
@@ -394,20 +379,11 @@ class OTFTemplateAttentionHead2D(nn.Module):
             persistent=True,
         )
 
-        self.raw_eta = nn.Parameter(torch.tensor(_softplus_inverse(eta), dtype=torch.float32))
         self.raw_alpha = nn.Parameter(torch.tensor(_softplus_inverse(alpha), dtype=torch.float32))
         self.raw_response_scale = nn.Parameter(
             torch.full((len(indices),), _softplus_inverse(response_scale_init), dtype=torch.float32)
         )
         self.tau = nn.Parameter(torch.full((len(indices),), float(tau_init), dtype=torch.float32))
-        self.use_amplitude_head = bool(use_amplitude_head)
-        self.amplitude_head = nn.Sequential(
-            nn.Linear(5, 16),
-            nn.GELU(),
-            nn.Linear(16, 1),
-        )
-        nn.init.zeros_(self.amplitude_head[-1].weight)
-        nn.init.constant_(self.amplitude_head[-1].bias, 0.0)
         self.confidence_head = nn.Sequential(
             nn.Linear(6, 16),
             nn.GELU(),
@@ -448,8 +424,6 @@ class OTFTemplateAttentionHead2D(nn.Module):
         sin_phase = phase_source.imag / denom * phase_mask
 
         self.template_bank.ensure(image)
-        if self.input_feature_channels == 3:
-            return torch.cat([amp, cos_phase.to(amp.dtype), sin_phase.to(amp.dtype)], dim=1)
         rho = self.template_bank.rho.to(device=image.device, dtype=amp.dtype)
         rho = rho.clamp(max=1.0).expand(amp.shape[0], amp.shape[1], -1, -1)
         return torch.cat(
@@ -478,38 +452,21 @@ class OTFTemplateAttentionHead2D(nn.Module):
         features: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         templates = self.template_bank.ensure(image)
-        derivative_templates = self.template_bank.derivative_templates.to(dtype=features.dtype, device=features.device)
         scores = torch.einsum("bchw,kqchw->bkq", features, templates.to(dtype=features.dtype, device=features.device))
-        derivative_score = torch.einsum("bchw,kchw->bk", features, derivative_templates)
         scores_pos = scores[..., 0]
         scores_neg = scores[..., 1]
         signed_score = scores_pos - scores_neg
         best_score = torch.maximum(scores_pos, scores_neg)
 
-        eta = torch.nn.functional.softplus(self.raw_eta)
         alpha = torch.nn.functional.softplus(self.raw_alpha)
         response_scale = torch.nn.functional.softplus(self.raw_response_scale).to(
             device=image.device,
-            dtype=derivative_score.dtype,
+            dtype=signed_score.dtype,
         )
-        sign = torch.tanh(response_scale[None, :] * derivative_score)
+        sign = torch.tanh(response_scale[None, :] * signed_score)
         presence = torch.sigmoid(alpha * (best_score - self.tau.to(device=image.device, dtype=best_score.dtype)))
         max_amp = self.max_amp_um.to(device=image.device, dtype=presence.dtype)
-        amplitude_inputs = torch.stack(
-            [
-                scores_pos,
-                scores_neg,
-                best_score,
-                torch.abs(signed_score),
-                presence,
-            ],
-            dim=-1,
-        )
-        if self.use_amplitude_head:
-            amplitude_gate = torch.sigmoid(self.amplitude_head(amplitude_inputs).squeeze(-1))
-        else:
-            amplitude_gate = torch.ones_like(presence)
-        magnitude = max_amp[None, :] * presence * amplitude_gate
+        magnitude = max_amp[None, :] * presence
         signed_mask = self.template_signed_mode_mask.to(device=image.device, dtype=torch.bool)
         a_signed = magnitude * sign
         a_template = torch.where(signed_mask[None, :], a_signed, magnitude)

@@ -710,8 +710,56 @@ def save_per_mode_attention_input_effects(
 def save_template_bank_figures(output_dir: Path, head, image: torch.Tensor, zernike_indices: tuple[int, ...]) -> None:
     head.template_bank.ensure(image)
     templates = head.template_bank.templates.detach().cpu()
-    derivative = head.template_bank.derivative_templates.detach().cpu()
     labels = _mode_labels(zernike_indices)
+    channel_titles = ("log amp", "relative cos", "relative sin")
+
+    atlas_columns: list[tuple[str, list[np.ndarray]]] = []
+    for sign_idx, sign_name in enumerate(("+eps", "-eps")):
+        for channel, channel_title in enumerate(channel_titles):
+            atlas_columns.append(
+                (
+                    f"{sign_name} {channel_title}",
+                    [templates[k, sign_idx, channel].numpy() for k in range(templates.shape[0])],
+                )
+            )
+    signed_delta = templates[:, 0] - templates[:, 1]
+    for channel, channel_title in enumerate(channel_titles):
+        atlas_columns.append(
+            (
+                f"+ - - {channel_title}",
+                [signed_delta[k, channel].numpy() for k in range(signed_delta.shape[0])],
+            )
+        )
+
+    fig, axes = plt.subplots(
+        len(labels),
+        len(atlas_columns),
+        figsize=(2.35 * len(atlas_columns), 2.15 * len(labels)),
+        squeeze=False,
+    )
+    for row_idx, label in enumerate(labels):
+        for col_idx, (title, images) in enumerate(atlas_columns):
+            ax = axes[row_idx, col_idx]
+            _show_image(ax, images[row_idx], title if row_idx == 0 else "", cmap="coolwarm", symmetric=True)
+            if col_idx == 0:
+                ax.set_ylabel(label, fontsize=8)
+    fig.suptitle(
+        f"Exact normalized attention template buffer: templates shape={tuple(templates.shape)}",
+        y=0.999,
+    )
+    fig.tight_layout()
+    fig.savefig(output_dir / "attention_template_buffer_atlas.png", dpi=180)
+    plt.close(fig)
+
+    np.savez_compressed(
+        output_dir / "attention_template_buffers.npz",
+        zernike_indices=np.asarray(zernike_indices),
+        template_shape=np.asarray(templates.shape),
+        templates=templates.numpy(),
+        epsilon_um=head.template_bank.epsilon_um.detach().cpu().numpy(),
+        rho=head.template_bank.rho.detach().cpu().numpy(),
+        pupil_mask=head.template_bank.pupil_mask.detach().cpu().numpy(),
+    )
 
     for channel, name in enumerate(("log_amp", "relative_cos", "relative_sin")):
         _save_grid(
@@ -722,24 +770,13 @@ def save_template_bank_figures(output_dir: Path, head, image: torch.Tensor, zern
             cmap="coolwarm",
             symmetric=True,
         )
-        _save_grid(
-            output_dir / f"template_derivative_{name}.png",
-            [derivative[k, channel].numpy() for k in range(derivative.shape[0])],
-            labels,
-            ncols=min(5, derivative.shape[0]),
-            cmap="coolwarm",
-            symmetric=True,
-        )
 
 
 def save_template_diagnostics(output_dir: Path, head, image: torch.Tensor, zernike_indices: tuple[int, ...]) -> None:
     head.template_bank.ensure(image)
     templates = head.template_bank.templates.detach().cpu()
-    derivative = head.template_bank.derivative_templates.detach().cpu()
     short_labels = [str(v) for v in zernike_indices]
 
-    derivative_flat = torch.nn.functional.normalize(derivative.flatten(1), dim=1)
-    derivative_similarity = derivative_flat @ derivative_flat.T
     signed_delta = templates[:, 0] - templates[:, 1]
     signed_delta_flat = torch.nn.functional.normalize(signed_delta.flatten(1), dim=1)
     signed_delta_similarity = signed_delta_flat @ signed_delta_flat.T
@@ -750,13 +787,6 @@ def save_template_diagnostics(output_dir: Path, head, image: torch.Tensor, zerni
     template_energy = torch.linalg.vector_norm(templates.flatten(2), dim=2).mean(dim=1).clamp_min(1e-8)
     signed_fraction = signed_energy / template_energy
 
-    _save_heatmap(
-        output_dir / "template_derivative_mode_similarity.png",
-        derivative_similarity.numpy(),
-        "Derivative template cosine similarity",
-        short_labels,
-        short_labels,
-    )
     _save_heatmap(
         output_dir / "template_signed_delta_mode_similarity.png",
         signed_delta_similarity.numpy(),
@@ -787,7 +817,6 @@ def save_template_diagnostics(output_dir: Path, head, image: torch.Tensor, zerni
     np.savez_compressed(
         output_dir / "template_diagnostics.npz",
         zernike_indices=np.asarray(zernike_indices),
-        derivative_similarity=derivative_similarity.numpy(),
         signed_delta_similarity=signed_delta_similarity.numpy(),
         positive_negative_cosine=pos_neg_cos.numpy(),
         signed_fraction=signed_fraction.numpy(),
@@ -800,16 +829,14 @@ def save_attention_score_summary(
     zernike_indices: tuple[int, ...],
     pos_scores: np.ndarray,
     neg_scores: np.ndarray,
-    der_scores: np.ndarray,
     prediction: np.ndarray | None,
     feature_label: str,
 ) -> None:
     x_axis = np.arange(len(zernike_indices))
     signed_scores = pos_scores - neg_scores
     coeff_scale = max(float(np.max(np.abs(coefficients))), 1e-8)
-    score_scale = max(float(np.max(np.abs(der_scores))), float(np.max(np.abs(signed_scores))), 1e-8)
+    score_scale = max(float(np.max(np.abs(signed_scores))), 1e-8)
     norm_coeff = coefficients / coeff_scale
-    norm_der = der_scores / score_scale
     norm_signed = signed_scores / score_scale
 
     rows = 4 if prediction is not None else 3
@@ -835,17 +862,15 @@ def save_attention_score_summary(
         compare_ax = axes[2]
 
     width = 0.26
-    score_ax.bar(x_axis - width, pos_scores, width=width, color="#64748b", label="positive template")
-    score_ax.bar(x_axis, neg_scores, width=width, color="#94a3b8", label="negative template")
-    score_ax.bar(x_axis + width, der_scores, width=width, color="#dc2626", label="derivative")
+    score_ax.bar(x_axis - width / 2, pos_scores, width=width, color="#64748b", label="positive template")
+    score_ax.bar(x_axis + width / 2, neg_scores, width=width, color="#94a3b8", label="negative template")
     score_ax.axhline(0.0, color="black", linewidth=0.8)
     score_ax.set_ylabel("score")
     score_ax.set_title(f"Mode scores from {feature_label}; flat bars mean weak mode selectivity")
-    score_ax.legend(loc="upper right", ncol=3)
+    score_ax.legend(loc="upper right", ncol=2)
     score_ax.grid(axis="y", linestyle="--", alpha=0.35)
 
     compare_ax.plot(x_axis, norm_coeff, marker="o", color="#111827", label="target coeff normalized")
-    compare_ax.plot(x_axis, norm_der, marker="s", color="#dc2626", label="derivative score normalized")
     compare_ax.plot(x_axis, norm_signed, marker="^", color="#2563eb", label="pos-neg score normalized")
     compare_ax.axhline(0.0, color="black", linewidth=0.8)
     compare_ax.set_ylabel("normalized")
@@ -885,20 +910,17 @@ def save_mode_correlation_figures(
                 float(getattr(head, "eps", 1e-8)),
             ).to(device=image.device, dtype=image.dtype)
         templates = head.template_bank.ensure(image).to(device=image.device, dtype=features.dtype)
-        derivative = head.template_bank.derivative_templates.to(device=image.device, dtype=features.dtype)
         pos_maps = (features[:, None] * templates[None, :, 0]).sum(dim=2)[0]
         neg_maps = (features[:, None] * templates[None, :, 1]).sum(dim=2)[0]
-        der_maps = (features[:, None] * derivative[None]).sum(dim=2)[0]
         pos_scores = pos_maps.flatten(1).sum(dim=1)
         neg_scores = neg_maps.flatten(1).sum(dim=1)
-        der_scores = der_maps.flatten(1).sum(dim=1)
         pred = scores = presence = sign = None
         if checkpoint_loaded:
             pred, scores, presence, sign = head._template_coefficients(image)
 
     labels = _mode_labels(zernike_indices)
     labels = [
-        f"{label}\npos={float(pos_scores[k]):.3f} neg={float(neg_scores[k]):.3f} d={float(der_scores[k]):.3f}"
+        f"{label}\npos={float(pos_scores[k]):.3f} neg={float(neg_scores[k]):.3f}"
         for k, label in enumerate(labels)
     ]
     ncols = min(5, len(zernike_indices))
@@ -918,27 +940,17 @@ def save_mode_correlation_figures(
         cmap="coolwarm",
         symmetric=True,
     )
-    _save_grid(
-        output_dir / f"mode_correlation_{feature_label}_derivative.png",
-        [der_maps[k].detach().cpu().numpy() for k in range(der_maps.shape[0])],
-        labels,
-        ncols=ncols,
-        cmap="coolwarm",
-        symmetric=True,
-    )
     coeff_np = _as_numpy(coefficients)
     pos_np = _as_numpy(pos_scores)
     neg_np = _as_numpy(neg_scores)
-    der_np = _as_numpy(der_scores)
     pred_np = None if pred is None else _as_numpy(pred[0])
-    save_attention_score_summary(output_dir, coeff_np, zernike_indices, pos_np, neg_np, der_np, pred_np, feature_label)
+    save_attention_score_summary(output_dir, coeff_np, zernike_indices, pos_np, neg_np, pred_np, feature_label)
 
     payload = {
         "zernike_indices": np.asarray(zernike_indices),
         "coefficients": coeff_np,
         "positive_map_scores": pos_np,
         "negative_map_scores": neg_np,
-        "derivative_map_scores": der_np,
         "feature_label": np.asarray(feature_label),
     }
     if pred is not None and scores is not None and presence is not None and sign is not None:
