@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_attention_modulated_pupil_phase_e005_b128_8obj_32ch_4blk_100ep",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_attention_modulated_pupil_phase_e005_b64_8obj_32ch_4blk_100ep",
   "model": {
     "name": "abesplit2d",
     "in_channels": 1,
@@ -71,8 +71,9 @@
   },
   "training": {
     "epochs": 100,
-    "batch_size": 128,
-    "val_batch_size": 128,
+    "batch_size": 64,
+    "val_batch_size": 64,
+    "micro_batch_size": 16,
     "same_object_batches": true,
     "synthetic_same_object_batches": true,
     "synthetic_batches_per_epoch": 250,
@@ -83,6 +84,7 @@
     "min_lr": 0.000005,
     "weight_decay": 0.00001,
     "grad_clip": 1.0,
+    "amp": true,
     "auto_max_amp": false,
     "max_amp_quantile": 0.95,
     "max_amp_scale": 1.1,
@@ -101,7 +103,7 @@
     "presence_bce_weight": 0.0,
     "mode_strength_kl_weight": 0.2,
     "pupil_phase_l1_weight": 1.0,
-    "reprojection_l1_weight": 0.1,
+    "reprojection_l1_weight": 0.0,
     "otf_feature_cosine_weight": 0.0,
     "otf_feature_l1_weight": 0.0,
     "presence_threshold_um": 0.02

@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ao2d.data.dataset import _center_crop_single, _estimate_scale_from_input, _random_crop_single, _to_tensor
 from ao2d.data.io import IMAGE_EXTENSIONS, load_image
 from ao2d.data.paths import resolve_path
+from ao2d.models.abenet2d import forward_aberration_head_2d
 from ao2d.models.factory import make_model
 from ao2d.optics import AO2DConfig, generate_psf2d_from_zernike, random_zernike_coefficients, zernike_wavefront
 from ao2d.training.forward_model import AO2DForwardModel
@@ -235,6 +236,39 @@ def get_template_head(model):
     if head is None or not hasattr(head, "_template_coefficients"):
         raise TypeError("Model must use a template attention compatible aberration head")
     return head
+
+
+def predict_coefficients_only(model, head, image: torch.Tensor) -> torch.Tensor:
+    """Run only the aberration branch when the architecture exposes split branches."""
+    if all(
+        hasattr(model, name)
+        for name in (
+            "gradient_transform",
+            "frequency_transform",
+            "abe_image_branch",
+            "abe_gradient_branch",
+            "abe_frequency_branch",
+            "abe_fusion",
+        )
+    ):
+        gradient = model.gradient_transform(image)
+        abe_image = model.abe_image_branch(image)
+        abe_gradient = model.abe_gradient_branch(gradient)
+        abe_frequency = model.abe_frequency_branch(model.frequency_transform(image))
+        abe_fused = model.abe_fusion(torch.cat([abe_image, abe_gradient, abe_frequency], dim=1))
+        return forward_aberration_head_2d(head, abe_fused, image)
+    _, pred = model(image)
+    return pred
+
+
+def configured_micro_batch_size(config: dict, fallback: int) -> int:
+    value = int(config.get("training", {}).get("micro_batch_size", fallback))
+    return max(1, value)
+
+
+def add_weighted_metrics(totals: dict[str, float], metrics: dict[str, float], weight: int) -> None:
+    for key, value in metrics.items():
+        totals[key] = totals.get(key, 0.0) + value * weight
 
 
 def is_attention_modulated_head(head) -> bool:
@@ -649,7 +683,7 @@ def attention_modulated_loss(
     strength_weight = float(weights.get("mode_strength_kl_weight", 0.0))
     reproj_weight = float(weights.get("reprojection_l1_weight", 0.0))
 
-    _, pred = model(image)
+    pred = predict_coefficients_only(model, head, image)
     loss = coeff_l1_weight * F.l1_loss(pred, target)
     if coeff_mse_weight > 0:
         loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
@@ -684,11 +718,42 @@ def attention_modulated_loss(
     metrics.update(mode_strength_metrics(None if mode_strength is None else mode_strength.detach(), target.detach()))
     a_base = getattr(head, "last_a_base", None)
     if a_base is not None:
-        metrics["base_mae"] = float((a_base.detach() - target.detach()).abs().mean())
+        base_detached = a_base.detach()
+        target_detached = target.detach()
+        pred_detached = pred.detach()
+        base_abs_error = (base_detached - target_detached).abs()
+        final_abs_error = (pred_detached - target_detached).abs()
+        base_mae = base_abs_error.mean()
+        final_mae = final_abs_error.mean()
+        signed_mask = _template_signed_mask(head, base_detached.device)
+        metrics["base_mae"] = float(base_mae)
+        metrics["base_signed_mae"] = float(
+            base_abs_error[:, signed_mask].mean()
+            if signed_mask is not None and bool(signed_mask.any().item())
+            else base_mae
+        )
+        metrics["modulation_gain_mae"] = float(base_mae - final_mae)
+        metrics["modulation_gain_ratio"] = float((base_mae - final_mae) / base_mae.clamp_min(1e-8))
+        metrics["modulation_help_frac"] = float(
+            (final_abs_error.mean(dim=-1) < base_abs_error.mean(dim=-1)).to(dtype=pred_detached.dtype).mean()
+        )
+        metrics["modulation_delta_abs"] = float((pred_detached - base_detached).abs().mean())
     modulation = getattr(head, "last_modulation", None)
     if modulation is not None:
         metrics["modulation_mean"] = float(modulation.detach().mean())
         metrics["modulation_std"] = float(modulation.detach().std())
+    if mode_strength is not None:
+        strength_detached = mode_strength.detach()
+        entropy = -(strength_detached * strength_detached.clamp_min(1e-8).log()).sum(dim=-1)
+        entropy = entropy / math.log(max(2, strength_detached.shape[-1]))
+        metrics["attention_entropy"] = float(entropy.mean())
+        metrics["attention_max_strength"] = float(strength_detached.max(dim=-1).values.mean())
+    raw_modulation_lambda = getattr(head, "raw_modulation_lambda", None)
+    if raw_modulation_lambda is not None:
+        metrics["modulation_lambda"] = float(F.softplus(raw_modulation_lambda.detach()))
+    raw_attention_temperature = getattr(head, "raw_attention_temperature", None)
+    if raw_attention_temperature is not None:
+        metrics["attention_temperature"] = float(F.softplus(raw_attention_temperature.detach()))
     metrics["loss"] = float(loss.detach())
     metrics["phase_loss"] = float(phase_loss.detach())
     metrics["strength_loss"] = float(strength_loss.detach())
@@ -696,28 +761,53 @@ def attention_modulated_loss(
     return loss, pred, metrics
 
 
-def run_attention_modulated_epoch(model, loader, optimizer, device, train: bool, config: dict) -> dict[str, float]:
+def run_attention_modulated_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    train: bool,
+    config: dict,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    use_amp: bool = False,
+) -> dict[str, float]:
     model.train(train)
     head = get_template_head(model)
     totals: dict[str, float] = {}
-    total_steps = 0
+    total_weight = 0
+    micro_batch_size = configured_micro_batch_size(config, int(config.get("training", {}).get("batch_size", 1)))
     with torch.set_grad_enabled(train):
         for batch in tqdm(loader, desc="train" if train else "val", leave=False):
             image = batch["input"].to(device, non_blocking=True)
             target = batch["coeff"].to(device, non_blocking=True)
-            loss, _, metrics = attention_modulated_loss(model, head, image, target, config)
             if train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0))),
-                )
-                optimizer.step()
-            for key, value in metrics.items():
-                totals[key] = totals.get(key, 0.0) + value
-            total_steps += 1
-    return {key: value / max(1, total_steps) for key, value in totals.items()}
+            batch_size = image.shape[0]
+            for start in range(0, batch_size, micro_batch_size):
+                end = min(batch_size, start + micro_batch_size)
+                chunk_weight = end - start
+                with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
+                    loss, _, metrics = attention_modulated_loss(model, head, image[start:end], target[start:end], config)
+                    scaled_loss = loss * (chunk_weight / batch_size)
+                if train:
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+                add_weighted_metrics(totals, metrics, chunk_weight)
+                total_weight += chunk_weight
+            if train:
+                trainable = [p for p in model.parameters() if p.requires_grad]
+                grad_clip = float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0)))
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                    optimizer.step()
+    return {key: value / max(1, total_weight) for key, value in totals.items()}
 
 
 def run_synthetic_attention_modulated_epoch(
@@ -729,12 +819,15 @@ def run_synthetic_attention_modulated_epoch(
     train: bool,
     config: dict,
     coeff_batch_size: int,
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    use_amp: bool = False,
 ) -> dict[str, float]:
     model.train(train)
     head = get_template_head(model)
     zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
     totals: dict[str, float] = {}
-    total_steps = 0
+    total_weight = 0
+    micro_batch_size = configured_micro_batch_size(config, coeff_batch_size)
     with torch.set_grad_enabled(train):
         for batch in tqdm(loader, desc="train" if train else "val", leave=False):
             obj = batch["object"].to(device, non_blocking=True)
@@ -743,29 +836,47 @@ def run_synthetic_attention_modulated_epoch(
             repeats[: coeff_batch_size % obj.shape[0]] += 1
             object_index = torch.repeat_interleave(torch.arange(obj.shape[0], device=device), repeats)
             obj_batch = obj.index_select(0, object_index).contiguous()
+            aberrated_chunks = []
             with torch.no_grad():
-                aberrated = forward_model(obj_batch, target).detach()
-            loss, _, metrics = attention_modulated_loss(
-                model,
-                head,
-                aberrated,
-                target,
-                config,
-                forward_model=forward_model,
-                clean_object=obj_batch,
-            )
+                for start in range(0, coeff_batch_size, micro_batch_size):
+                    end = min(coeff_batch_size, start + micro_batch_size)
+                    aberrated_chunks.append(forward_model(obj_batch[start:end], target[start:end]).detach())
+                aberrated = torch.cat(aberrated_chunks, dim=0)
             if train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0))),
-                )
-                optimizer.step()
-            for key, value in metrics.items():
-                totals[key] = totals.get(key, 0.0) + value
-            total_steps += 1
-    return {key: value / max(1, total_steps) for key, value in totals.items()}
+            for start in range(0, coeff_batch_size, micro_batch_size):
+                end = min(coeff_batch_size, start + micro_batch_size)
+                chunk_weight = end - start
+                with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
+                    loss, _, metrics = attention_modulated_loss(
+                        model,
+                        head,
+                        aberrated[start:end],
+                        target[start:end],
+                        config,
+                        forward_model=forward_model,
+                        clean_object=obj_batch[start:end],
+                    )
+                    scaled_loss = loss * (chunk_weight / coeff_batch_size)
+                if train:
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+                add_weighted_metrics(totals, metrics, chunk_weight)
+                total_weight += chunk_weight
+            if train:
+                trainable = [p for p in model.parameters() if p.requires_grad]
+                grad_clip = float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0)))
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                    optimizer.step()
+    return {key: value / max(1, total_weight) for key, value in totals.items()}
 
 
 def save_validation_coefficient_figures(
@@ -1089,6 +1200,8 @@ def main() -> None:
         lr=float(config["training"].get("lr", config["training"].get("initial_lr", 1e-4))),
         weight_decay=float(config["training"].get("weight_decay", 1e-5)),
     )
+    use_amp = bool(config["training"].get("amp", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, int(config["training"].get("epochs", 50))),
@@ -1113,10 +1226,14 @@ def main() -> None:
                     True,
                     config,
                     train_batch_size,
+                    scaler,
+                    use_amp,
                 )
             elif attention_modulated:
                 train_loader = make_loader(train_set, config, "train", train_batch_size, epoch)
-                train_metrics = run_attention_modulated_epoch(model, train_loader, optimizer, device, True, config)
+                train_metrics = run_attention_modulated_epoch(
+                    model, train_loader, optimizer, device, True, config, scaler, use_amp
+                )
             elif synthetic_train:
                 train_loader = make_object_loader(train_set, config, epoch)
                 train_metrics = run_synthetic_same_object_epoch(
@@ -1133,7 +1250,9 @@ def main() -> None:
                 train_loader = make_loader(train_set, config, "train", train_batch_size, epoch)
                 train_metrics = run_epoch(head, train_loader, optimizer, device, True, config)
             if attention_modulated:
-                val_metrics = run_attention_modulated_epoch(model, val_loader, optimizer, device, False, config)
+                val_metrics = run_attention_modulated_epoch(
+                    model, val_loader, optimizer, device, False, config, None, use_amp
+                )
             else:
                 val_metrics = run_epoch(head, val_loader, optimizer, device, False, config)
             scheduler.step()
@@ -1149,6 +1268,8 @@ def main() -> None:
                 f"epoch={epoch:03d} "
                 f"train_mae={train_metrics['mae']:.5f} val_mae={val_metrics['mae']:.5f} "
                 f"val_signed_mae={val_metrics.get('signed_mae', float('nan')):.5f} "
+                f"val_base_mae={val_metrics.get('base_mae', float('nan')):.5f} "
+                f"val_mod_gain={val_metrics.get('modulation_gain_mae', float('nan')):.5f} "
                 f"val_sign={val_metrics['sign_acc']:.3f} "
                 f"val_strength_kl={val_metrics.get('strength_kl', float('nan')):.4f} "
                 f"val_presence={val_metrics.get('presence_acc', float('nan')):.3f}"
