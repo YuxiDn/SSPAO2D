@@ -28,7 +28,7 @@ from ao2d.data.dataset import _center_crop_single, _estimate_scale_from_input, _
 from ao2d.data.io import IMAGE_EXTENSIONS, load_image
 from ao2d.data.paths import resolve_path
 from ao2d.models.factory import make_model
-from ao2d.optics import AO2DConfig, generate_psf2d_from_zernike, random_zernike_coefficients
+from ao2d.optics import AO2DConfig, generate_psf2d_from_zernike, random_zernike_coefficients, zernike_wavefront
 from ao2d.training.forward_model import AO2DForwardModel
 
 
@@ -230,12 +230,22 @@ def get_template_head(model):
     head = getattr(model, "zernike_head", None)
     if head is None:
         head = getattr(model, "aberration_head", None)
+    if head is not None and hasattr(head, "template_head"):
+        return head
     if head is None or not hasattr(head, "_template_coefficients"):
-        raise TypeError("Model must use aberration_head_type='template_attention'")
+        raise TypeError("Model must use a template attention compatible aberration head")
     return head
 
 
+def is_attention_modulated_head(head) -> bool:
+    return hasattr(head, "phase_head") and hasattr(head, "template_head") and hasattr(head, "last_mode_strength")
+
+
 def set_trainable_template_params(head, train_thresholds: bool = True) -> list[torch.nn.Parameter]:
+    if is_attention_modulated_head(head):
+        for param in head.parameters():
+            param.requires_grad = True
+        return [param for param in head.parameters() if param.requires_grad]
     for param in head.parameters():
         param.requires_grad = False
     for param in head.encoder.parameters():
@@ -386,6 +396,54 @@ def target_otf_features(
         phase_sin = relative_phase.imag / phase_den * mtf_support
         target = torch.stack([log_amp, phase_cos, phase_sin], dim=1).real.to(dtype=coefficients.dtype)
         return normalize_otf_feature_target(target, eps)
+
+
+def target_pupil_opd(
+    coefficients: torch.Tensor,
+    zernike_indices: tuple[int, ...],
+    pupil_grid_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    axis = torch.linspace(-1.0, 1.0, pupil_grid_size, device=coefficients.device, dtype=coefficients.dtype)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    rho = torch.hypot(xx, yy)
+    theta = torch.atan2(yy, xx)
+    mask = rho <= 1.0
+    opd = zernike_wavefront(zernike_indices, coefficients, rho, theta)
+    mask_f = mask.to(dtype=opd.dtype, device=opd.device)
+    opd = opd * mask_f
+    piston = opd.sum(dim=(-2, -1), keepdim=True) / mask_f.sum().clamp_min(torch.finfo(opd.dtype).eps)
+    return (opd - piston) * mask_f, mask
+
+
+def mode_strength_distribution(coefficients: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    strength = coefficients.abs() + eps
+    return strength / strength.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def mode_strength_kl(pred_strength: torch.Tensor, target_coefficients: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    target = mode_strength_distribution(target_coefficients, eps)
+    pred = pred_strength.clamp_min(eps)
+    pred = pred / pred.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return (target * (target.clamp_min(eps).log() - pred.log())).sum(dim=-1).mean()
+
+
+def mode_strength_metrics(pred_strength: torch.Tensor | None, target_coefficients: torch.Tensor) -> dict[str, float]:
+    if pred_strength is None:
+        return {}
+    with torch.no_grad():
+        target = mode_strength_distribution(target_coefficients)
+        kl = mode_strength_kl(pred_strength, target_coefficients)
+        top1 = (pred_strength.argmax(dim=-1) == target.argmax(dim=-1)).float().mean()
+        corr_num = ((pred_strength - pred_strength.mean(dim=-1, keepdim=True)) * (target - target.mean(dim=-1, keepdim=True))).sum(dim=-1)
+        corr_den = (
+            torch.linalg.vector_norm(pred_strength - pred_strength.mean(dim=-1, keepdim=True), dim=-1)
+            * torch.linalg.vector_norm(target - target.mean(dim=-1, keepdim=True), dim=-1)
+        ).clamp_min(1e-8)
+        return {
+            "strength_kl": float(kl.detach()),
+            "strength_top1": float(top1.detach()),
+            "strength_corr": float((corr_num / corr_den).mean().detach()),
+        }
 
 
 def make_optics_config(config: dict) -> AO2DConfig:
@@ -568,6 +626,142 @@ def run_synthetic_same_object_epoch(
             metrics["response_scale_mean"] = float(torch.nn.functional.softplus(head.raw_response_scale).mean().detach())
             metrics["tau_mean"] = float(head.tau.mean().detach())
             metrics["otf_loss"] = float(otf_loss.detach())
+            for key, value in metrics.items():
+                totals[key] = totals.get(key, 0.0) + value
+            total_steps += 1
+    return {key: value / max(1, total_steps) for key, value in totals.items()}
+
+
+def attention_modulated_loss(
+    model,
+    head,
+    image: torch.Tensor,
+    target: torch.Tensor,
+    config: dict,
+    forward_model: AO2DForwardModel | None = None,
+    clean_object: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    weights = config.get("loss", {})
+    zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
+    coeff_l1_weight = float(weights.get("coeff_l1_weight", 1.0))
+    coeff_mse_weight = float(weights.get("coeff_mse_weight", 0.0))
+    phase_weight = float(weights.get("pupil_phase_l1_weight", weights.get("phase_l1_weight", 0.0)))
+    strength_weight = float(weights.get("mode_strength_kl_weight", 0.0))
+    reproj_weight = float(weights.get("reprojection_l1_weight", 0.0))
+
+    _, pred = model(image)
+    loss = coeff_l1_weight * F.l1_loss(pred, target)
+    if coeff_mse_weight > 0:
+        loss = loss + coeff_mse_weight * F.mse_loss(pred, target)
+
+    phase_loss = pred.new_zeros(())
+    pred_phase = getattr(head, "last_phase", None)
+    if phase_weight > 0 and pred_phase is not None:
+        target_phase, pupil_mask = target_pupil_opd(target, zernike_indices, pred_phase.shape[-1])
+        pupil_mask = pupil_mask.to(device=pred_phase.device)
+        phase_loss = F.l1_loss(pred_phase[:, pupil_mask], target_phase[:, pupil_mask])
+        loss = loss + phase_weight * phase_loss
+
+    strength_loss = pred.new_zeros(())
+    mode_strength = getattr(head, "last_mode_strength", None)
+    if strength_weight > 0 and mode_strength is not None:
+        strength_loss = mode_strength_kl(mode_strength, target)
+        loss = loss + strength_weight * strength_loss
+
+    reproj_loss = pred.new_zeros(())
+    if reproj_weight > 0 and forward_model is not None and clean_object is not None:
+        reproj = forward_model(clean_object, pred)
+        reproj_loss = F.l1_loss(reproj, image)
+        loss = loss + reproj_weight * reproj_loss
+
+    metrics = coefficient_metrics(
+        pred.detach(),
+        target.detach(),
+        torch.zeros_like(pred.detach()),
+        float(weights.get("presence_threshold_um", 0.02)),
+        None,
+    )
+    metrics.update(mode_strength_metrics(None if mode_strength is None else mode_strength.detach(), target.detach()))
+    a_base = getattr(head, "last_a_base", None)
+    if a_base is not None:
+        metrics["base_mae"] = float((a_base.detach() - target.detach()).abs().mean())
+    modulation = getattr(head, "last_modulation", None)
+    if modulation is not None:
+        metrics["modulation_mean"] = float(modulation.detach().mean())
+        metrics["modulation_std"] = float(modulation.detach().std())
+    metrics["loss"] = float(loss.detach())
+    metrics["phase_loss"] = float(phase_loss.detach())
+    metrics["strength_loss"] = float(strength_loss.detach())
+    metrics["reproj_loss"] = float(reproj_loss.detach())
+    return loss, pred, metrics
+
+
+def run_attention_modulated_epoch(model, loader, optimizer, device, train: bool, config: dict) -> dict[str, float]:
+    model.train(train)
+    head = get_template_head(model)
+    totals: dict[str, float] = {}
+    total_steps = 0
+    with torch.set_grad_enabled(train):
+        for batch in tqdm(loader, desc="train" if train else "val", leave=False):
+            image = batch["input"].to(device, non_blocking=True)
+            target = batch["coeff"].to(device, non_blocking=True)
+            loss, _, metrics = attention_modulated_loss(model, head, image, target, config)
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0))),
+                )
+                optimizer.step()
+            for key, value in metrics.items():
+                totals[key] = totals.get(key, 0.0) + value
+            total_steps += 1
+    return {key: value / max(1, total_steps) for key, value in totals.items()}
+
+
+def run_synthetic_attention_modulated_epoch(
+    model,
+    loader,
+    forward_model: AO2DForwardModel,
+    optimizer,
+    device,
+    train: bool,
+    config: dict,
+    coeff_batch_size: int,
+) -> dict[str, float]:
+    model.train(train)
+    head = get_template_head(model)
+    zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
+    totals: dict[str, float] = {}
+    total_steps = 0
+    with torch.set_grad_enabled(train):
+        for batch in tqdm(loader, desc="train" if train else "val", leave=False):
+            obj = batch["object"].to(device, non_blocking=True)
+            target = random_coefficients_batch(coeff_batch_size, zernike_indices, device, config).to(dtype=obj.dtype)
+            repeats = torch.full((obj.shape[0],), coeff_batch_size // obj.shape[0], device=device, dtype=torch.long)
+            repeats[: coeff_batch_size % obj.shape[0]] += 1
+            object_index = torch.repeat_interleave(torch.arange(obj.shape[0], device=device), repeats)
+            obj_batch = obj.index_select(0, object_index).contiguous()
+            with torch.no_grad():
+                aberrated = forward_model(obj_batch, target).detach()
+            loss, _, metrics = attention_modulated_loss(
+                model,
+                head,
+                aberrated,
+                target,
+                config,
+                forward_model=forward_model,
+                clean_object=obj_batch,
+            )
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    float(config.get("training", {}).get("grad_clip", config.get("grad_clip", 1.0))),
+                )
+                optimizer.step()
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0.0) + value
             total_steps += 1
@@ -868,12 +1062,14 @@ def main() -> None:
 
     model = make_model(config["model"]).to(device)
     head = get_template_head(model)
+    attention_modulated = is_attention_modulated_head(head)
     if bool(config["training"].get("auto_max_amp", True)):
         q = float(config["training"].get("max_amp_quantile", 0.95))
         scale = float(config["training"].get("max_amp_scale", 1.1))
         max_amp_source = val_set if synthetic_train else train_set
         max_amp = estimate_max_amp(max_amp_source, q, scale).to(device)
-        head.max_amp_um = max_amp
+        template_param_head = getattr(head, "template_head", head)
+        template_param_head.max_amp_um = max_amp
         print(f"Using max_amp_um from q={q}: {max_amp.detach().cpu().numpy().round(4).tolist()}")
 
     forward_model = None
@@ -882,7 +1078,12 @@ def main() -> None:
         zernike_indices = tuple(int(v) for v in config["model"].get("zernike_indices", list(range(3, 16))))
         forward_model = AO2DForwardModel(image_size, zernike_indices, make_optics_config(config)).to(device)
 
-    trainable = set_trainable_template_params(head, bool(config["training"].get("train_thresholds", True)))
+    if attention_modulated:
+        for param in model.parameters():
+            param.requires_grad = True
+        trainable = [param for param in model.parameters() if param.requires_grad]
+    else:
+        trainable = set_trainable_template_params(head, bool(config["training"].get("train_thresholds", True)))
     optimizer = torch.optim.AdamW(
         trainable,
         lr=float(config["training"].get("lr", config["training"].get("initial_lr", 1e-4))),
@@ -901,7 +1102,22 @@ def main() -> None:
         writer = None
         for epoch in range(1, int(config["training"].get("epochs", 50)) + 1):
             train_batch_size = batch_size_for_epoch(config, epoch)
-            if synthetic_train:
+            if attention_modulated and synthetic_train:
+                train_loader = make_object_loader(train_set, config, epoch)
+                train_metrics = run_synthetic_attention_modulated_epoch(
+                    model,
+                    train_loader,
+                    forward_model,
+                    optimizer,
+                    device,
+                    True,
+                    config,
+                    train_batch_size,
+                )
+            elif attention_modulated:
+                train_loader = make_loader(train_set, config, "train", train_batch_size, epoch)
+                train_metrics = run_attention_modulated_epoch(model, train_loader, optimizer, device, True, config)
+            elif synthetic_train:
                 train_loader = make_object_loader(train_set, config, epoch)
                 train_metrics = run_synthetic_same_object_epoch(
                     head,
@@ -916,7 +1132,10 @@ def main() -> None:
             else:
                 train_loader = make_loader(train_set, config, "train", train_batch_size, epoch)
                 train_metrics = run_epoch(head, train_loader, optimizer, device, True, config)
-            val_metrics = run_epoch(head, val_loader, optimizer, device, False, config)
+            if attention_modulated:
+                val_metrics = run_attention_modulated_epoch(model, val_loader, optimizer, device, False, config)
+            else:
+                val_metrics = run_epoch(head, val_loader, optimizer, device, False, config)
             scheduler.step()
             row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"], "batch_size": train_batch_size}
             row.update({f"train_{key}": value for key, value in train_metrics.items()})
@@ -930,10 +1149,13 @@ def main() -> None:
                 f"epoch={epoch:03d} "
                 f"train_mae={train_metrics['mae']:.5f} val_mae={val_metrics['mae']:.5f} "
                 f"val_signed_mae={val_metrics.get('signed_mae', float('nan')):.5f} "
-                f"val_sign={val_metrics['sign_acc']:.3f} val_presence={val_metrics['presence_acc']:.3f}"
+                f"val_sign={val_metrics['sign_acc']:.3f} "
+                f"val_strength_kl={val_metrics.get('strength_kl', float('nan')):.4f} "
+                f"val_presence={val_metrics.get('presence_acc', float('nan')):.3f}"
             )
-            save_validation_coefficient_figures(head, val_set, output_dir, device, epoch, config)
-            save_same_object_batch_figure(head, val_set, output_dir, device, epoch, config)
+            if not attention_modulated:
+                save_validation_coefficient_figures(head, val_set, output_dir, device, epoch, config)
+                save_same_object_batch_figure(head, val_set, output_dir, device, epoch, config)
             checkpoint = {
                 "epoch": epoch,
                 "config": config,

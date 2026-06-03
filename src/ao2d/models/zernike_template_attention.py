@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from ao2d.optics import AO2DConfig, generate_psf2d_from_zernike, pupil_coordinates_2d, zernike_index_to_nm
 
 from .scare2d import ZernikeResNetRegression2D
+from .zernike_projection import PupilPhaseZernikeProjectionHead2D
 
 
 def _group_count(channels: int, max_groups: int = 8) -> int:
@@ -519,3 +520,116 @@ class OTFTemplateAttentionHead2D(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("OTFTemplateAttentionHead2D requires forward_with_image(features, image).")
+
+
+class AttentionModulatedPupilPhaseHead2D(nn.Module):
+    """Pupil phase projection head modulated by OTF template mode-strength attention."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        zernike_indices: Iterable[int],
+        image_size: Sequence[int] | None = None,
+        optics_config: AO2DConfig = AO2DConfig(),
+        hidden: int = 128,
+        depth: int = 3,
+        reduction: int = 8,
+        pair_count: int = 512,
+        pupil_grid_size: int = 32,
+        ridge: float = 1e-4,
+        max_phase_opd: float | None = 0.75,
+        epsilon_um: float | Sequence[float] = 0.05,
+        max_amp_um: float | Sequence[float] | None = None,
+        max_amp_base_um: float = 0.12,
+        encoder_channels: int = 32,
+        encoder_blocks: int = 3,
+        encoder_kernel_size: int = 5,
+        encoder_type: str = "depthwise",
+        alpha: float = 10.0,
+        tau_init: float = 0.3,
+        confidence_init: float = 1.4,
+        fft_shift: bool = True,
+        input_center: bool = True,
+        input_phase_mask_percentile: float = 72.0,
+        otf_mtf_threshold: float = 0.03,
+        modulation_lambda: float = 0.5,
+        attention_temperature: float = 8.0,
+        centered_modulation: bool = True,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(v) for v in zernike_indices)
+        self.zernike_indices = indices
+        self.eps = float(eps)
+        self.centered_modulation = bool(centered_modulation)
+        self.phase_head = PupilPhaseZernikeProjectionHead2D(
+            in_channels,
+            indices,
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+            pair_count=pair_count,
+            pupil_grid_size=pupil_grid_size,
+            ridge=ridge,
+            max_phase_opd=max_phase_opd,
+        )
+        self.template_head = OTFTemplateAttentionHead2D(
+            in_channels,
+            indices,
+            image_size=image_size,
+            optics_config=optics_config,
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+            epsilon_um=epsilon_um,
+            max_amp_um=max_amp_um,
+            max_amp_base_um=max_amp_base_um,
+            encoder_channels=encoder_channels,
+            encoder_blocks=encoder_blocks,
+            encoder_kernel_size=encoder_kernel_size,
+            encoder_type=encoder_type,
+            alpha=alpha,
+            tau_init=tau_init,
+            confidence_init=confidence_init,
+            fft_shift=fft_shift,
+            input_center=input_center,
+            input_phase_mask_percentile=input_phase_mask_percentile,
+            otf_mtf_threshold=otf_mtf_threshold,
+            eps=eps,
+            signed_zernike_indices=None,
+        )
+        self.raw_modulation_lambda = nn.Parameter(
+            torch.tensor(_softplus_inverse(max(float(modulation_lambda), eps)), dtype=torch.float32)
+        )
+        self.raw_attention_temperature = nn.Parameter(
+            torch.tensor(_softplus_inverse(max(float(attention_temperature), eps)), dtype=torch.float32)
+        )
+        self.last_a_base: torch.Tensor | None = None
+        self.last_mode_strength: torch.Tensor | None = None
+        self.last_modulation: torch.Tensor | None = None
+        self.last_scores: torch.Tensor | None = None
+        self.last_phase: torch.Tensor | None = None
+
+    def forward_with_image(self, features: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+        a_base = self.phase_head(features)
+        _, scores, _, _ = self.template_head._template_coefficients(image)
+        best_score = torch.maximum(scores[..., 0], scores[..., 1])
+        temperature = F.softplus(self.raw_attention_temperature).to(device=features.device, dtype=best_score.dtype)
+        mode_strength = torch.softmax(temperature * best_score, dim=-1)
+        modulation_lambda = F.softplus(self.raw_modulation_lambda).to(device=features.device, dtype=a_base.dtype)
+        if self.centered_modulation:
+            centered = mode_strength - mode_strength.mean(dim=-1, keepdim=True)
+            modulation = 1.0 + modulation_lambda * centered.to(dtype=a_base.dtype)
+        else:
+            modulation = 1.0 + modulation_lambda * mode_strength.to(dtype=a_base.dtype)
+        a_final = modulation * a_base
+
+        self.last_a_base = a_base.detach()
+        self.last_mode_strength = mode_strength.detach()
+        self.last_modulation = modulation.detach()
+        self.last_scores = scores.detach()
+        self.last_phase = self.phase_head.last_phase
+        return a_final
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("AttentionModulatedPupilPhaseHead2D requires forward_with_image(features, image).")

@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_template_attention_depthwise_presenceonly_e005_b128_8obj_32ch_4blk_100ep",
+  "output_dir": "/data/yxdeng993/output/SSPAO2D/pretrain_attention_modulated_pupil_phase_e005_b128_8obj_32ch_4blk_100ep",
   "model": {
     "name": "abesplit2d",
     "in_channels": 1,
@@ -17,7 +17,7 @@
     "zernike_reduction": 16,
     "fft": true,
     "fft_phase_features": true,
-    "aberration_head_type": "template_attention",
+    "aberration_head_type": "attention_modulated_pupil_phase",
     "template_attention": {
       "epsilon_um": 0.05,
       "max_amp_um": [
@@ -36,7 +36,10 @@
       "tau_init": 0.3,
       "confidence_init": 1.4,
       "max_amp_base_um": 0.12,
-      "signed_zernike_indices": [6, 7, 8, 9, 15]
+      "signed_zernike_indices": [6, 7, 8, 9, 15],
+      "modulation_lambda": 0.5,
+      "attention_temperature": 8.0,
+      "centered_modulation": true
     }
   },
   "optics": {
@@ -84,7 +87,7 @@
     "max_amp_quantile": 0.95,
     "max_amp_scale": 1.1,
     "train_thresholds": true,
-    "best_metric": "signed_mae",
+    "best_metric": "mae",
     "use_object_reference_features": false,
     "zernike_rms_min": 0.02,
     "zernike_rms_max": 0.30,
@@ -95,8 +98,11 @@
     "coeff_l1_weight": 1.0,
     "coeff_mse_weight": 0.1,
     "magnitude_l1_weight": 0.0,
-    "presence_bce_weight": 0.05,
-    "otf_feature_cosine_weight": 0.2,
+    "presence_bce_weight": 0.0,
+    "mode_strength_kl_weight": 0.2,
+    "pupil_phase_l1_weight": 1.0,
+    "reprojection_l1_weight": 0.1,
+    "otf_feature_cosine_weight": 0.0,
     "otf_feature_l1_weight": 0.0,
     "presence_threshold_um": 0.02
   },

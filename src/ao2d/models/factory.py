@@ -85,6 +85,15 @@ def _template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
             template_cfg.get("otf_mtf_threshold", config.get("template_otf_mtf_threshold", 0.03))
         ),
         template_signed_zernike_indices=None if signed_indices is None else tuple(int(v) for v in signed_indices),
+        template_modulation_lambda=float(
+            template_cfg.get("modulation_lambda", config.get("template_modulation_lambda", 0.5))
+        ),
+        template_attention_temperature=float(
+            template_cfg.get("attention_temperature", config.get("template_attention_temperature", 8.0))
+        ),
+        template_centered_modulation=bool(
+            template_cfg.get("centered_modulation", config.get("template_centered_modulation", True))
+        ),
     )
 
 

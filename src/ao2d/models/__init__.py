@@ -8,7 +8,11 @@ from .rcan2d import RCAN2D
 from .rln2d import RLN2D
 from .scare2d import SCARE2D, ZernikeRegression2D
 from .sfenet2d import SFENet2D
-from .zernike_template_attention import OTFTemplateAttentionHead2D, ZernikeOTFTemplateBank2D
+from .zernike_template_attention import (
+    AttentionModulatedPupilPhaseHead2D,
+    OTFTemplateAttentionHead2D,
+    ZernikeOTFTemplateBank2D,
+)
 from .zernike_projection import (
     DeltaPhiZernikeProjectionHead2D,
     PupilPhaseZernikeProjectionHead2D,
@@ -35,6 +39,7 @@ __all__ = [
     "PupilPhaseZernikeProjectionHead2D",
     "ZernikeOTFTemplateBank2D",
     "OTFTemplateAttentionHead2D",
+    "AttentionModulatedPupilPhaseHead2D",
     "BranchEncoder2D",
     "LogFFTAmplitude2D",
     "LogFFTAmplitudePhase2D",

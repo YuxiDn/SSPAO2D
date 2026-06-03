@@ -8,7 +8,7 @@ from ao2d.optics import AO2DConfig
 from .blocks import output_activation
 from .scare2d import SobelGradient2D, ZernikeResNetRegression2D
 from .sfenet2d import ResUNet2D
-from .zernike_template_attention import OTFTemplateAttentionHead2D
+from .zernike_template_attention import AttentionModulatedPupilPhaseHead2D, OTFTemplateAttentionHead2D
 from .zernike_projection import DeltaPhiZernikeProjectionHead2D, PupilPhaseZernikeProjectionHead2D
 
 
@@ -121,6 +121,9 @@ def make_aberration_head_2d(
     template_input_phase_mask_percentile: float = 72.0,
     template_otf_mtf_threshold: float = 0.03,
     template_signed_zernike_indices: tuple[int, ...] | None = None,
+    template_modulation_lambda: float = 0.5,
+    template_attention_temperature: float = 8.0,
+    template_centered_modulation: bool = True,
 ) -> nn.Module:
     head_type = str(head_type).lower()
     indices = tuple(range(3, 3 + zernike_modes)) if zernike_indices is None else tuple(int(v) for v in zernike_indices)
@@ -183,6 +186,41 @@ def make_aberration_head_2d(
             otf_mtf_threshold=template_otf_mtf_threshold,
             signed_zernike_indices=template_signed_zernike_indices,
         )
+    if head_type in {
+        "attention_modulated_pupil_phase",
+        "template_modulated_pupil_phase",
+        "pupil_phase_attention_modulated",
+    }:
+        return AttentionModulatedPupilPhaseHead2D(
+            in_channels,
+            indices,
+            image_size=template_image_size,
+            optics_config=template_optics_config or AO2DConfig(),
+            hidden=hidden,
+            depth=depth,
+            reduction=reduction,
+            pair_count=delta_phi_pair_count,
+            pupil_grid_size=delta_phi_pupil_grid_size,
+            ridge=delta_phi_ridge,
+            max_phase_opd=delta_phi_max_opd,
+            epsilon_um=template_epsilon_um,
+            max_amp_um=template_max_amp_um,
+            max_amp_base_um=template_max_amp_base_um,
+            encoder_channels=template_encoder_channels,
+            encoder_blocks=template_encoder_blocks,
+            encoder_kernel_size=template_encoder_kernel_size,
+            encoder_type=template_encoder_type,
+            alpha=template_alpha,
+            tau_init=template_tau_init,
+            confidence_init=template_confidence_init,
+            fft_shift=template_fft_shift,
+            input_center=template_input_center,
+            input_phase_mask_percentile=template_input_phase_mask_percentile,
+            otf_mtf_threshold=template_otf_mtf_threshold,
+            modulation_lambda=template_modulation_lambda,
+            attention_temperature=template_attention_temperature,
+            centered_modulation=template_centered_modulation,
+        )
     raise ValueError(f"Unsupported aberration_head_type: {head_type}")
 
 
@@ -237,6 +275,9 @@ class ABEFusionNet2D(nn.Module):
         template_input_phase_mask_percentile: float = 72.0,
         template_otf_mtf_threshold: float = 0.03,
         template_signed_zernike_indices: tuple[int, ...] | None = None,
+        template_modulation_lambda: float = 0.5,
+        template_attention_temperature: float = 8.0,
+        template_centered_modulation: bool = True,
         fft: bool = True,
         fft_shift: bool = False,
         fft_phase_features: bool = False,
@@ -300,6 +341,9 @@ class ABEFusionNet2D(nn.Module):
             template_input_phase_mask_percentile=template_input_phase_mask_percentile,
             template_otf_mtf_threshold=template_otf_mtf_threshold,
             template_signed_zernike_indices=template_signed_zernike_indices,
+            template_modulation_lambda=template_modulation_lambda,
+            template_attention_temperature=template_attention_temperature,
+            template_centered_modulation=template_centered_modulation,
         )
         self.activation = output_activation(final_activation)
 

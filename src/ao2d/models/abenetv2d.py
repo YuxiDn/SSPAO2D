@@ -60,6 +60,9 @@ class ABEFusionNetV2D(nn.Module):
         template_input_phase_mask_percentile: float = 72.0,
         template_otf_mtf_threshold: float = 0.03,
         template_signed_zernike_indices: tuple[int, ...] | None = None,
+        template_modulation_lambda: float = 0.5,
+        template_attention_temperature: float = 8.0,
+        template_centered_modulation: bool = True,
         fft: bool = True,
         fft_shift: bool = False,
         fft_phase_features: bool = False,
@@ -132,6 +135,9 @@ class ABEFusionNetV2D(nn.Module):
             template_input_phase_mask_percentile=template_input_phase_mask_percentile,
             template_otf_mtf_threshold=template_otf_mtf_threshold,
             template_signed_zernike_indices=template_signed_zernike_indices,
+            template_modulation_lambda=template_modulation_lambda,
+            template_attention_temperature=template_attention_temperature,
+            template_centered_modulation=template_centered_modulation,
         )
         self.activation = output_activation(final_activation)
 
